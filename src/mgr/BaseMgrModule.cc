@@ -1106,6 +1106,12 @@ ceph_add_mds_perf_query(BaseMgrModule *self, PyObject *args)
     {"opened_inodes", MDSPerformanceCounterType::OPENED_INODES_METRIC},
     {"read_io_sizes", MDSPerformanceCounterType::READ_IO_SIZES_METRIC},
     {"write_io_sizes", MDSPerformanceCounterType::WRITE_IO_SIZES_METRIC},
+    {"avg_read_latency", MDSPerformanceCounterType::AVG_READ_LATENCY_METRIC},
+    {"stdev_read_latency", MDSPerformanceCounterType::STDEV_READ_LATENCY_METRIC},
+    {"avg_write_latency", MDSPerformanceCounterType::AVG_WRITE_LATENCY_METRIC},
+    {"stdev_write_latency", MDSPerformanceCounterType::STDEV_WRITE_LATENCY_METRIC},
+    {"avg_metadata_latency", MDSPerformanceCounterType::AVG_METADATA_LATENCY_METRIC},
+    {"stdev_metadata_latency", MDSPerformanceCounterType::STDEV_METADATA_LATENCY_METRIC},
   };
 
   PyObject *py_query = nullptr;
@@ -1411,6 +1417,12 @@ ceph_unregister_client(BaseMgrModule *self, PyObject *args)
   Py_RETURN_NONE;
 }
 
+static PyObject*
+ceph_get_daemon_health_metrics(BaseMgrModule *self, PyObject *args)
+{
+  return self->py_modules->get_daemon_health_metrics();
+}
+
 PyMethodDef BaseMgrModule_methods[] = {
   {"_ceph_get", (PyCFunction)ceph_state_get, METH_VARARGS,
    "Get a cluster object"},
@@ -1536,6 +1548,9 @@ PyMethodDef BaseMgrModule_methods[] = {
 
   {"_ceph_unregister_client", (PyCFunction)ceph_unregister_client,
     METH_VARARGS, "Unregister RADOS instance for potential blocklisting"},
+
+  {"_ceph_get_daemon_health_metrics", (PyCFunction)ceph_get_daemon_health_metrics,
+    METH_VARARGS, "Get health metrics for all daemons"},
 
   {NULL, NULL, 0, NULL}
 };

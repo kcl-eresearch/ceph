@@ -496,11 +496,20 @@ candidate hosts.
    If there are fewer hosts selected by the placement specification than
    demanded by ``count``, cephadm will deploy only on the selected hosts.
 
+.. _cephadm-extra-container-args:
+
 Extra Container Arguments
 =========================
 
 .. warning:: 
-  The arguments provided for extra container args are limited to whatever arguments are available for a `run` command from whichever container engine you are using. Providing any arguments the `run` command does not support (or invalid values for arguments) will cause the daemon to fail to start.
+  The arguments provided for extra container args are limited to whatever arguments are available for
+  a `run` command from whichever container engine you are using. Providing any arguments the `run`
+  command does not support (or invalid values for arguments) will cause the daemon to fail to start.
+
+.. note::
+
+  For arguments passed to the process running inside the container rather than the for
+  the container runtime itself, see :ref:`cephadm-extra-entrypoint-args`
 
 
 Cephadm supports providing extra miscellaneous container arguments for
@@ -518,9 +527,107 @@ a spec like
         - host2
         - host3
     extra_container_args:
-      -  "--cpus=2"
+      - "--cpus=2"
 
 which would cause each mon daemon to be deployed with `--cpus=2`.
+
+Mounting Files with Extra Container Arguments
+---------------------------------------------
+
+A common use case for extra container arguments is to mount additional
+files within the container. However, some intuitive formats for doing
+so can cause deployment to fail (see https://tracker.ceph.com/issues/57338).
+The recommended syntax for mounting a file with extra container arguments is:
+
+.. code-block:: yaml
+
+    extra_container_args:
+      - "-v"
+      - "/absolute/file/path/on/host:/absolute/file/path/in/container"
+
+For example:
+
+.. code-block:: yaml
+
+    extra_container_args:
+      - "-v"
+      - "/opt/ceph_cert/host.cert:/etc/grafana/certs/cert_file:ro"
+
+.. _cephadm-extra-entrypoint-args:
+
+Extra Entrypoint Arguments
+==========================
+
+
+.. note::
+
+  For arguments intended for the container runtime rather than the process inside
+  it, see :ref:`cephadm-extra-container-args`
+
+Similar to extra container args for the container runtime, Cephadm supports
+appending to args passed to the entrypoint process running
+within a container. For example, to set the collector textfile directory for
+the node-exporter service , one could apply a service spec like
+
+.. code-block:: yaml
+
+  service_type: node-exporter
+  service_name: node-exporter
+  placement:
+    host_pattern: '*'
+  extra_entrypoint_args:
+    - "--collector.textfile.directory=/var/lib/node_exporter/textfile_collector2"
+
+Custom Config Files
+===================
+
+Cephadm supports specifying miscellaneous config files for daemons.
+To do so, users must provide both the content of the config file and the
+location within the daemon's container at which it should be mounted. After
+applying a YAML spec with custom config files specified and having cephadm
+redeploy the daemons for which the config files are specified, these files will
+be mounted within the daemon's container at the specified location.
+
+Example service spec:
+
+.. code-block:: yaml
+
+    service_type: grafana
+    service_name: grafana
+    custom_configs:
+      - mount_path: /etc/example.conf
+        content: |
+          setting1 = value1
+          setting2 = value2
+      - mount_path: /usr/share/grafana/example.cert
+        content: |
+          -----BEGIN PRIVATE KEY-----
+          V2VyIGRhcyBsaWVzdCBpc3QgZG9vZi4gTG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFt
+          ZXQsIGNvbnNldGV0dXIgc2FkaXBzY2luZyBlbGl0ciwgc2VkIGRpYW0gbm9udW15
+          IGVpcm1vZCB0ZW1wb3IgaW52aWR1bnQgdXQgbGFib3JlIGV0IGRvbG9yZSBtYWdu
+          YSBhbGlxdXlhbSBlcmF0LCBzZWQgZGlhbSB2b2x1cHR1YS4gQXQgdmVybyBlb3Mg
+          ZXQgYWNjdXNhbSBldCBqdXN0byBkdW8=
+          -----END PRIVATE KEY-----
+          -----BEGIN CERTIFICATE-----
+          V2VyIGRhcyBsaWVzdCBpc3QgZG9vZi4gTG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFt
+          ZXQsIGNvbnNldGV0dXIgc2FkaXBzY2luZyBlbGl0ciwgc2VkIGRpYW0gbm9udW15
+          IGVpcm1vZCB0ZW1wb3IgaW52aWR1bnQgdXQgbGFib3JlIGV0IGRvbG9yZSBtYWdu
+          YSBhbGlxdXlhbSBlcmF0LCBzZWQgZGlhbSB2b2x1cHR1YS4gQXQgdmVybyBlb3Mg
+          ZXQgYWNjdXNhbSBldCBqdXN0byBkdW8=
+          -----END CERTIFICATE-----
+
+To make these new config files actually get mounted within the
+containers for the daemons
+
+.. prompt:: bash
+
+  ceph orch redeploy <service-name>
+
+For example:
+
+.. prompt:: bash
+
+  ceph orch redeploy grafana
 
 .. _orch-rm:
 

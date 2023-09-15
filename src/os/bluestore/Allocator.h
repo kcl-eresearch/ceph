@@ -54,7 +54,8 @@ public:
   void release(const PExtentVector& release_set);
 
   virtual void dump() = 0;
-  virtual void dump(std::function<void(uint64_t offset, uint64_t length)> notify) = 0;
+  virtual void foreach(
+    std::function<void(uint64_t offset, uint64_t length)> notify) = 0;
 
   virtual void zoned_set_zone_states(std::vector<zone_state_t> &&_zone_states) {}
   virtual bool zoned_get_zones_to_clean(std::deque<uint64_t> *zones_to_clean) {
@@ -79,7 +80,7 @@ public:
   const string& get_name() const;
   int64_t get_capacity() const
   {
-    return capacity;
+    return device_size;
   }
   int64_t get_block_size() const
   {
@@ -89,9 +90,9 @@ public:
 private:
   class SocketHook;
   SocketHook* asok_hook = nullptr;
-
-  int64_t capacity = 0;
-  int64_t block_size = 0;
+protected:
+  const int64_t device_size = 0;
+  const int64_t block_size = 0;
 };
 
 #endif

@@ -11,9 +11,10 @@ from .exception import VolumeException
 
 log = logging.getLogger(__name__)
 
-def create_pool(mgr, pool_name):
+def create_pool(mgr, pool_name, **extra_args):
     # create the given pool
-    command = {'prefix': 'osd pool create', 'pool': pool_name}
+    command = extra_args
+    command.update({'prefix': 'osd pool create', 'pool': pool_name})
     return mgr.mon_command(command)
 
 def remove_pool(mgr, pool_name):
@@ -77,6 +78,28 @@ def listdir(fs, dirpath, filter_entries=None):
     except cephfs.Error as e:
         raise VolumeException(-e.args[0], e.args[1])
     return dirs
+
+
+def has_subdir(fs, dirpath, filter_entries=None):
+    """
+    Check the presence of directory (only dirs) for a given path
+    """
+    res = False
+    if filter_entries is None:
+        filter_entries = [b".", b".."]
+    else:
+        filter_entries.extend([b".", b".."])
+    try:
+        with fs.opendir(dirpath) as dir_handle:
+            d = fs.readdir(dir_handle)
+            while d:
+                if (d.d_name not in filter_entries) and d.is_dir():
+                    res = True
+                    break
+                d = fs.readdir(dir_handle)
+    except cephfs.Error as e:
+        raise VolumeException(-e.args[0], e.args[1])
+    return res
 
 def is_inherited_snap(snapname):
     """

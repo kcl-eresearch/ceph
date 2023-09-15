@@ -179,7 +179,9 @@ void MDSDaemon::asok_command(
       if (cmd_getval(cmdmap, "value", value)) {
 	heapcmd_vec.push_back(value);
       }
-      ceph_heap_profiler_handle_command(heapcmd_vec, ss);
+      std::stringstream outss;
+      ceph_heap_profiler_handle_command(heapcmd_vec, outss);
+      outbl.append(outss);
       r = 0;
     }
   } else if (command == "cpu_profiler") {
@@ -188,6 +190,7 @@ void MDSDaemon::asok_command(
     vector<string> argvec;
     get_str_vec(arg, argvec);
     cpu_profiler_handle_command(argvec, ss);
+    r = 0;
   } else {
     if (mds_rank == NULL) {
       dout(1) << "Can't run that command on an inactive MDS!" << dendl;
@@ -274,7 +277,7 @@ void MDSDaemon::set_up_admin_socket()
   ceph_assert(r == 0);
   r = admin_socket->register_command("scrub start "
 				     "name=path,type=CephString "
-				     "name=scrubops,type=CephChoices,strings=force|recursive|repair,n=N,req=false "
+				     "name=scrubops,type=CephChoices,strings=force|recursive|repair|scrub_mdsdir,n=N,req=false "
 				     "name=tag,type=CephString,req=false",
 				     asok_hook,
 				     "scrub and inode and output results");
@@ -1067,7 +1070,7 @@ bool MDSDaemon::parse_caps(const AuthCapsInfo& info, MDSAuthCaps& caps)
   }
 }
 
-int MDSDaemon::ms_handle_authentication(Connection *con)
+int MDSDaemon::ms_handle_fast_authentication(Connection *con)
 {
   /* N.B. without mds_lock! */
   MDSAuthCaps caps;

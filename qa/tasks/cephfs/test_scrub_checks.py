@@ -139,8 +139,7 @@ done
 
         # resume and verify
         self._resume_scrub(0)
-        out_json = self.fs.get_scrub_status()
-        self.assertTrue("no active" in out_json['status'])
+        self.assertTrue(self.fs.wait_until_scrub_complete(sleep=5, timeout=30))
 
         checked = self._check_task_status_na()
         self.assertTrue(checked)
@@ -168,15 +167,13 @@ done
         # Kill the rank 0
         self.fs.mds_stop(original_active)
 
-        grace = float(self.fs.get_config("mds_beacon_grace", service_type="mon"))
-
         def promoted():
             active = self.fs.get_active_names()
             return active and active[0] in original_standbys
 
         log.info("Waiting for promotion of one of the original standbys {0}".format(
             original_standbys))
-        self.wait_until_true(promoted, timeout=grace*2)
+        self.wait_until_true(promoted, timeout=self.fs.beacon_timeout)
 
         self._check_task_status_na()
 
@@ -299,6 +296,36 @@ class TestScrubChecks(CephFSTestCase):
         command = "flush_path /"
         self.asok_command(mds_rank, command, success_validator)
 
+    def scrub_with_stray_evaluation(self, fs, mnt, path, flag, files=2000,
+                                    _hard_links=3):
+        fs.set_allow_new_snaps(True)
+
+        test_dir = "stray_eval_dir"
+        mnt.run_shell(["mkdir", test_dir])
+        client_path = os.path.join(mnt.mountpoint, test_dir)
+        mnt.create_n_files(fs_path=f"{test_dir}/file", count=files,
+                           hard_links=_hard_links)
+        mnt.run_shell(["mkdir", f"{client_path}/.snap/snap1-{test_dir}"])
+        mnt.run_shell(f"find {client_path}/ -type f -delete")
+        mnt.run_shell(["rmdir", f"{client_path}/.snap/snap1-{test_dir}"])
+        perf_dump = fs.rank_tell(["perf", "dump"], 0)
+        self.assertNotEqual(perf_dump.get('mds_cache').get('num_strays'),
+                            0, "mdcache.num_strays is zero")
+
+        log.info(
+            f"num of strays: {perf_dump.get('mds_cache').get('num_strays')}")
+
+        out_json = fs.run_scrub(["start", path, flag])
+        self.assertNotEqual(out_json, None)
+        self.assertEqual(out_json["return_code"], 0)
+
+        self.assertEqual(
+            fs.wait_until_scrub_complete(tag=out_json["scrub_tag"]), True)
+
+        perf_dump = fs.rank_tell(["perf", "dump"], 0)
+        self.assertEqual(int(perf_dump.get('mds_cache').get('num_strays')),
+                         0, "mdcache.num_strays is non-zero")
+
     def test_scrub_repair(self):
         mds_rank = 0
         test_dir = "scrub_repair_path"
@@ -334,6 +361,20 @@ class TestScrubChecks(CephFSTestCase):
 
         # fragstat should be fixed
         self.mount_a.run_shell(["rmdir", test_dir])
+
+    def test_stray_evaluation_with_scrub(self):
+        """
+        test that scrub can iterate over ~mdsdir and evaluate strays
+        """
+        self.scrub_with_stray_evaluation(self.fs, self.mount_a, "~mdsdir",
+                                         "recursive")
+
+    def test_flag_scrub_mdsdir(self):
+        """
+        test flag scrub_mdsdir
+        """
+        self.scrub_with_stray_evaluation(self.fs, self.mount_a, "/",
+                                         "recursive,scrub_mdsdir")
 
     @staticmethod
     def json_validator(json_out, rc, element, expected_value):

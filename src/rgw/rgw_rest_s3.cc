@@ -490,8 +490,8 @@ int RGWGetObj_ObjStore_S3::override_range_hdr(const rgw::auth::StrategyRegistry&
     std::string key = "HTTP_";
     key.append(*k);
     boost::replace_all(key, "-", "_");
+    ldpp_dout(this, 10) << "after splitting cache kv key: " << key  << " " << *v << dendl;
     rgw_env->set(std::move(key), std::string(*v));
-    ldpp_dout(this, 10) << "after splitting cache kv key: " << key  << " " << rgw_env->get(key.c_str())  << dendl;
   }
   ret = RGWOp::verify_requester(auth_registry, y);
   if(!ret && backup_range) {
@@ -3832,7 +3832,7 @@ void RGWListBucketMultiparts_ObjStore_S3::send_response()
     s->formatter->dump_string("Tenant", s->bucket_tenant);
   s->formatter->dump_string("Bucket", s->bucket_name);
   if (!prefix.empty())
-    s->formatter->dump_string("ListMultipartUploadsResult.Prefix", prefix);
+    s->formatter->dump_string("Prefix", prefix);
   const string& key_marker = marker.get_key();
   if (!key_marker.empty())
     s->formatter->dump_string("KeyMarker", key_marker);
@@ -3871,10 +3871,9 @@ void RGWListBucketMultiparts_ObjStore_S3::send_response()
       s->formatter->open_array_section("CommonPrefixes");
       for (const auto& kv : common_prefixes) {
         if (encode_url) {
-          s->formatter->dump_string("CommonPrefixes.Prefix",
-                                    url_encode(kv.first, false));
+          s->formatter->dump_string("Prefix", url_encode(kv.first, false));
         } else {
-          s->formatter->dump_string("CommonPrefixes.Prefix", kv.first);
+          s->formatter->dump_string("Prefix", kv.first);
         }
       }
       s->formatter->close_section();
@@ -3926,22 +3925,35 @@ void RGWDeleteMultiObj_ObjStore_S3::begin_response()
   rgw_flush_formatter(s, s->formatter);
 }
 
-void RGWDeleteMultiObj_ObjStore_S3::send_partial_response(rgw_obj_key& key,
+void RGWDeleteMultiObj_ObjStore_S3::send_partial_response(const rgw_obj_key& key,
 							  bool delete_marker,
-							  const string& marker_version_id, int ret)
+							  const string& marker_version_id,
+                                                          int ret,
+                                                          boost::asio::deadline_timer *formatter_flush_cond)
 {
   if (!key.empty()) {
-    if (ret == 0 && !quiet) {
-      s->formatter->open_object_section("Deleted");
-      s->formatter->dump_string("Key", key.name);
-      if (!key.instance.empty()) {
-	s->formatter->dump_string("VersionId", key.instance);
-      }
+    delete_multi_obj_entry ops_log_entry;
+    ops_log_entry.key = key.name;
+    ops_log_entry.version_id = key.instance;
+    if (ret == 0) {
+      ops_log_entry.error = false;
+      ops_log_entry.http_status = 200;
+      ops_log_entry.delete_marker = delete_marker;
       if (delete_marker) {
-	s->formatter->dump_bool("DeleteMarker", true);
-	s->formatter->dump_string("DeleteMarkerVersionId", marker_version_id);
+        ops_log_entry.marker_version_id = marker_version_id;
       }
-      s->formatter->close_section();
+      if (!quiet) {
+        s->formatter->open_object_section("Deleted");
+        s->formatter->dump_string("Key", key.name);
+        if (!key.instance.empty()) {
+            s->formatter->dump_string("VersionId", key.instance);
+        }
+        if (delete_marker) {
+            s->formatter->dump_bool("DeleteMarker", true);
+            s->formatter->dump_string("DeleteMarkerVersionId", marker_version_id);
+        }
+        s->formatter->close_section();
+      }
     } else if (ret < 0) {
       struct rgw_http_error r;
       int err_no;
@@ -3951,6 +3963,10 @@ void RGWDeleteMultiObj_ObjStore_S3::send_partial_response(rgw_obj_key& key,
       err_no = -ret;
       rgw_get_errno_s3(&r, err_no);
 
+      ops_log_entry.error = true;
+      ops_log_entry.http_status = r.http_ret;
+      ops_log_entry.error_message = r.s3_code;
+
       s->formatter->dump_string("Key", key.name);
       s->formatter->dump_string("VersionId", key.instance);
       s->formatter->dump_string("Code", r.s3_code);
@@ -3958,7 +3974,12 @@ void RGWDeleteMultiObj_ObjStore_S3::send_partial_response(rgw_obj_key& key,
       s->formatter->close_section();
     }
 
-    rgw_flush_formatter(s, s->formatter);
+    ops_log_entries.push_back(std::move(ops_log_entry));
+    if (formatter_flush_cond) {
+      formatter_flush_cond->cancel();
+    } else {
+      rgw_flush_formatter(s, s->formatter);
+    }
   }
 }
 
@@ -4679,9 +4700,11 @@ int RGWHandler_REST_S3::postauth_init(optional_yield y)
 {
   struct req_init_state *t = &s->init_state;
 
-  rgw_parse_url_bucket(t->url_bucket, s->user->get_tenant(),
-		      s->bucket_tenant, s->bucket_name);
-
+  int ret = rgw_parse_url_bucket(t->url_bucket, s->user->get_tenant(),
+                                 s->bucket_tenant, s->bucket_name);
+  if (ret) {
+    return ret;
+  }
   if (s->auth.identity->get_identity_type() == TYPE_ROLE) {
     s->bucket_tenant = s->auth.identity->get_role_tenant();
   }
@@ -4689,7 +4712,6 @@ int RGWHandler_REST_S3::postauth_init(optional_yield y)
   ldpp_dout(s, 10) << "s->object=" << s->object
            << " s->bucket=" << rgw_make_bucket_entry_name(s->bucket_tenant, s->bucket_name) << dendl;
 
-  int ret;
   ret = rgw_validate_tenant_name(s->bucket_tenant);
   if (ret)
     return ret;
@@ -4706,8 +4728,11 @@ int RGWHandler_REST_S3::postauth_init(optional_yield y)
     } else {
       auth_tenant = s->user->get_tenant();
     }
-    rgw_parse_url_bucket(t->src_bucket, auth_tenant,
-			s->src_tenant_name, s->src_bucket_name);
+    ret = rgw_parse_url_bucket(t->src_bucket, auth_tenant,
+                               s->src_tenant_name, s->src_bucket_name);
+    if (ret) {
+      return ret;
+    }
     ret = rgw_validate_tenant_name(s->src_tenant_name);
     if (ret)
       return ret;
@@ -5247,33 +5272,7 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
     throw -EPERM;
   }
 
-  bool is_non_s3_op = false;
-  if (s->op_type == RGW_STS_GET_SESSION_TOKEN ||
-      s->op_type == RGW_STS_ASSUME_ROLE ||
-      s->op_type == RGW_STS_ASSUME_ROLE_WEB_IDENTITY ||
-      s->op_type == RGW_OP_CREATE_ROLE ||
-      s->op_type == RGW_OP_DELETE_ROLE ||
-      s->op_type == RGW_OP_GET_ROLE ||
-      s->op_type == RGW_OP_MODIFY_ROLE ||
-      s->op_type == RGW_OP_LIST_ROLES ||
-      s->op_type == RGW_OP_PUT_ROLE_POLICY ||
-      s->op_type == RGW_OP_GET_ROLE_POLICY ||
-      s->op_type == RGW_OP_LIST_ROLE_POLICIES ||
-      s->op_type == RGW_OP_DELETE_ROLE_POLICY ||
-      s->op_type == RGW_OP_PUT_USER_POLICY ||
-      s->op_type == RGW_OP_GET_USER_POLICY ||
-      s->op_type == RGW_OP_LIST_USER_POLICIES ||
-      s->op_type == RGW_OP_DELETE_USER_POLICY ||
-      s->op_type == RGW_OP_CREATE_OIDC_PROVIDER ||
-      s->op_type == RGW_OP_DELETE_OIDC_PROVIDER ||
-      s->op_type == RGW_OP_GET_OIDC_PROVIDER ||
-      s->op_type == RGW_OP_LIST_OIDC_PROVIDERS ||
-      s->op_type == RGW_OP_PUBSUB_TOPIC_CREATE ||
-      s->op_type == RGW_OP_PUBSUB_TOPICS_LIST ||
-      s->op_type == RGW_OP_PUBSUB_TOPIC_GET ||
-      s->op_type == RGW_OP_PUBSUB_TOPIC_DELETE) {
-    is_non_s3_op = true;
-  }
+  bool is_non_s3_op = rgw::auth::s3::is_non_s3_op(s->op_type);
 
   const char* exp_payload_hash = nullptr;
   string payload_hash;
@@ -5921,6 +5920,7 @@ rgw::auth::s3::STSEngine::authenticate(
   rgw_user user_id;
   string role_id;
   rgw::auth::RoleApplier::Role r;
+  rgw::auth::RoleApplier::TokenAttrs t_attrs;
   if (! token.roleId.empty()) {
     RGWRole role(s->cct, ctl, token.roleId);
     if (role.get_by_id(dpp, y) < 0) {
@@ -5937,8 +5937,6 @@ rgw::auth::s3::STSEngine::authenticate(
         r.role_policies.push_back(std::move(perm_policy));
       }
     }
-    // This is mostly needed to assign the owner of a bucket during its creation
-    user_id = token.user;
   }
 
   if (! token.user.empty() && token.acct_type != TYPE_ROLE) {
@@ -5955,7 +5953,13 @@ rgw::auth::s3::STSEngine::authenticate(
                                             get_creds_info(token));
     return result_t::grant(std::move(apl), completer_factory(boost::none));
   } else if (token.acct_type == TYPE_ROLE) {
-    auto apl = role_apl_factory->create_apl_role(cct, s, r, user_id, token.policy, token.role_session, token.token_claims, token.issued_at);
+    t_attrs.user_id = std::move(token.user); // This is mostly needed to assign the owner of a bucket during its creation
+    t_attrs.token_policy = std::move(token.policy);
+    t_attrs.role_session_name = std::move(token.role_session);
+    t_attrs.token_claims = std::move(token.token_claims);
+    t_attrs.token_issued_at = std::move(token.issued_at);
+    t_attrs.principal_tags = std::move(token.principal_tags);
+    auto apl = role_apl_factory->create_apl_role(cct, s, r, t_attrs);
     return result_t::grant(std::move(apl), completer_factory(token.secret_access_key));
   } else { // This is for all local users of type TYPE_RGW or TYPE_NONE
     string subuser;

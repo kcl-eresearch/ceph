@@ -31,17 +31,11 @@ class FuseMount(CephFSMount):
         self.inst = None
         self.addr = None
 
-    def mount(self, mntopts=[], createfs=True, check_status=True, **kwargs):
+    def mount(self, mntopts=[], check_status=True, **kwargs):
         self.update_attrs(**kwargs)
         self.assert_and_log_minimum_mount_details()
 
         self.setup_netns()
-
-        if createfs:
-            # TODO: don't call setupfs() from within mount(), since it's
-            # absurd. The proper order should be: create FS first and then
-            # call mount().
-            self.setupfs(name=self.cephfs_name)
 
         try:
             return self._mount(mntopts, check_status)
@@ -91,6 +85,9 @@ class FuseMount(CephFSMount):
             fuse_cmd += ['--id', self.client_id]
         if self.client_keyring_path and self.client_id is not None:
             fuse_cmd += ['-k', self.client_keyring_path]
+
+        self.validate_subvol_options()
+
         if self.cephfs_mntpt is not None:
             fuse_cmd += ["--client_mountpoint=" + self.cephfs_mntpt]
         if self.cephfs_name is not None:

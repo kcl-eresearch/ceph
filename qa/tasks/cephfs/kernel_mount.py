@@ -28,23 +28,22 @@ class KernelMount(CephFSMount):
             client_keyring_path=client_keyring_path, hostfs_mntpt=hostfs_mntpt,
             cephfs_name=cephfs_name, cephfs_mntpt=cephfs_mntpt, brxnet=brxnet)
 
+        self.client_config = config
         self.rbytes = config.get('rbytes', False)
+        self.snapdirname = config.get('snapdirname', '.snap')
         self.inst = None
         self.addr = None
 
-    def mount(self, mntopts=[], createfs=True, check_status=True, **kwargs):
+    def mount(self, mntopts=[], check_status=True, **kwargs):
         self.update_attrs(**kwargs)
         self.assert_and_log_minimum_mount_details()
 
         self.setup_netns()
 
-        # TODO: don't call setupfs() from within mount(), since it's
-        # absurd. The proper order should be: create FS first and then
-        # call mount().
-        if createfs:
-            self.setupfs(name=self.cephfs_name)
         if not self.cephfs_mntpt:
             self.cephfs_mntpt = '/'
+        if not self.cephfs_name:
+            self.cephfs_name = 'cephfs'
 
         stderr = StringIO()
         try:
@@ -86,6 +85,8 @@ class KernelMount(CephFSMount):
             opts += ",rbytes"
         else:
             opts += ",norbytes"
+        if self.snapdirname != '.snap':
+            opts += f',snapdirname={self.snapdirname}'
         if mntopts:
             opts += ',' + ','.join(mntopts)
 

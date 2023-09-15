@@ -248,6 +248,9 @@ void MDSMonitor::encode_pending(MonitorDBStore::TransactionRef t)
       health.decode(bl_i);
     }
     for (const auto &metric : health.metrics) {
+      if (metric.type == MDS_HEALTH_DUMMY) {
+        continue;
+      }
       const auto rank = info.rank;
       health_check_t *check = &new_checks.get_or_add(
 	mds_metric_name(metric.type),
@@ -410,7 +413,14 @@ bool MDSMonitor::preprocess_beacon(MonOpRequestRef op)
       mon.send_reply(op, m.detach());
       return true;
     } else {
-      return false;  // not booted yet.
+      /* check if we've already recorded its entry in pending */
+      const auto& pending = get_pending_fsmap();
+      if (pending.gid_exists(gid)) {
+        /* MDS is already booted. */
+        goto ignore;
+      } else {
+        return false;  // not booted yet.
+      }
     }
   }
   dout(10) << __func__ << ": GID exists in map: " << gid << dendl;
@@ -551,7 +561,7 @@ bool MDSMonitor::prepare_update(MonOpRequestRef op)
     } catch (const bad_cmd_get& e) {
       bufferlist bl;
       mon.reply_command(op, -EINVAL, e.what(), bl, get_last_committed());
-      return true;
+      return false; /* nothing to propose */
     }
 
   case MSG_MDS_OFFLOAD_TARGETS:
@@ -561,7 +571,7 @@ bool MDSMonitor::prepare_update(MonOpRequestRef op)
     ceph_abort();
   }
 
-  return true;
+  return false; /* nothing to propose! */
 }
 
 bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
@@ -593,10 +603,16 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
 
   std::set<mds_metric_t> new_types;
   for (const auto &i : new_health) {
+    if (i.type == MDS_HEALTH_DUMMY) {
+      continue;
+    }
     new_types.insert(i.type);
   }
 
   for (const auto &new_metric: new_health) {
+    if (new_metric.type == MDS_HEALTH_DUMMY) {
+      continue;
+    }
     if (old_types.count(new_metric.type) == 0) {
       dout(10) << "MDS health message (" << m->get_orig_source()
 	       << "): " << new_metric.sev << " " << new_metric.message << dendl;
@@ -691,26 +707,27 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
       return true;
     }
 
+    if (state == MDSMap::STATE_DNE) {
+      dout(1) << __func__ << ": DNE from " << info << dendl;
+      goto evict;
+    }
+
     // legal state change?
-    if ((info.state == MDSMap::STATE_STANDBY && state > 0) ||
-        (info.state == MDSMap::STATE_STANDBY_REPLAY && state > 0 && state != MDSMap::STATE_DAMAGED)) {
-      /* N.B.: standby-replay can indicate the rank is damaged due to failure to replay */
-      dout(10) << "mds_beacon mds can't activate itself (" << ceph_mds_state_name(info.state)
-	       << " -> " << ceph_mds_state_name(state) << ")" << dendl;
+    if ((info.state == MDSMap::STATE_STANDBY && state != info.state) ||
+        (info.state == MDSMap::STATE_STANDBY_REPLAY && state != info.state && state != MDSMap::STATE_DAMAGED)) {
+      // Standby daemons should never modify their own state.
+      // Except that standby-replay can indicate the rank is damaged due to failure to replay.
+      // Reject any attempts to do so.
+      derr << "standby " << gid << " attempted to change state to "
+           << ceph_mds_state_name(state) << ", rejecting" << dendl;
       goto evict;
-    } else if ((state == MDSMap::STATE_STANDBY || state == MDSMap::STATE_STANDBY_REPLAY)
-        && info.rank != MDS_RANK_NONE)
-    {
-      dout(4) << "mds_beacon MDS can't go back into standby after taking rank: "
-                 "held rank " << info.rank << " while requesting state "
-              << ceph_mds_state_name(state) << dendl;
-      goto evict;
-    } else if (info.state == MDSMap::STATE_STOPPING &&
-        state != MDSMap::STATE_STOPPING &&
-        state != MDSMap::STATE_STOPPED) {
-      // we can't transition to any other states from STOPPING
-      dout(0) << "got beacon for MDS in STATE_STOPPING, ignoring requested state change"
-	       << dendl;
+    } else if (info.state != MDSMap::STATE_STANDBY && state != info.state &&
+               !MDSMap::state_transition_valid(info.state, state)) {
+      // Validate state transitions for daemons that hold a rank
+      derr << "daemon " << gid << " (rank " << info.rank << ") "
+           << "reported invalid state transition "
+           << ceph_mds_state_name(info.state) << " -> "
+           << ceph_mds_state_name(state) << dendl;
       goto evict;
     }
 
@@ -791,23 +808,6 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
       last_beacon.erase(rankgid);
 
       /* MDS expects beacon reply back */
-    } else if (state == MDSMap::STATE_DNE) {
-      dout(1) << __func__ << ": DNE from " << info << dendl;
-      goto evict;
-    } else if (info.state == MDSMap::STATE_STANDBY && state != info.state) {
-      // Standby daemons should never modify their own
-      // state.  Reject any attempts to do so.
-      derr << "standby " << gid << " attempted to change state to "
-           << ceph_mds_state_name(state) << ", rejecting" << dendl;
-      goto evict;
-    } else if (info.state != MDSMap::STATE_STANDBY && state != info.state &&
-               !MDSMap::state_transition_valid(info.state, state)) {
-      // Validate state transitions for daemons that hold a rank
-      derr << "daemon " << gid << " (rank " << info.rank << ") "
-           << "reported invalid state transition "
-           << ceph_mds_state_name(info.state) << " -> "
-           << ceph_mds_state_name(state) << dendl;
-      goto evict;
     } else {
       if (info.state != MDSMap::STATE_ACTIVE && state == MDSMap::STATE_ACTIVE) {
         const auto &fscid = pending.mds_roles.at(gid);
@@ -871,6 +871,7 @@ null:
 bool MDSMonitor::prepare_offload_targets(MonOpRequestRef op)
 {
   auto &pending = get_pending_fsmap_writeable();
+  bool propose = false;
 
   op->mark_mdsmon_event(__func__);
   auto m = op->get_req<MMDSLoadTargets>();
@@ -878,11 +879,12 @@ bool MDSMonitor::prepare_offload_targets(MonOpRequestRef op)
   if (pending.gid_has_rank(gid)) {
     dout(10) << "prepare_offload_targets " << gid << " " << m->targets << dendl;
     pending.update_export_targets(gid, m->targets);
+    propose = true;
   } else {
     dout(10) << "prepare_offload_targets " << gid << " not in map" << dendl;
   }
   mon.no_reply(op);
-  return true;
+  return propose;
 }
 
 bool MDSMonitor::should_propose(double& delay)
@@ -1352,7 +1354,7 @@ bool MDSMonitor::prepare_command(MonOpRequestRef op)
   if (!cmdmap_from_json(m->cmd, &cmdmap, ss)) {
     string rs = ss.str();
     mon.reply_command(op, -EINVAL, rs, rdata, get_last_committed());
-    return true;
+    return false;
   }
 
   string prefix;
@@ -1362,7 +1364,7 @@ bool MDSMonitor::prepare_command(MonOpRequestRef op)
   MonSession *session = op->get_session();
   if (!session) {
     mon.reply_command(op, -EACCES, "access denied", rdata, get_last_committed());
-    return true;
+    return false;
   }
 
   auto &pending = get_pending_fsmap_writeable();
@@ -1419,8 +1421,7 @@ bool MDSMonitor::prepare_command(MonOpRequestRef op)
 out:
   dout(4) << __func__ << " done, r=" << r << dendl;
   /* Compose response */
-  string rs;
-  getline(ss, rs);
+  string rs = ss.str();
 
   if (r >= 0) {
     // success.. delay reply
@@ -1821,7 +1822,9 @@ void MDSMonitor::check_sub(Subscription *sub)
 void MDSMonitor::update_metadata(mds_gid_t gid,
 				 const map<string, string>& metadata)
 {
+  dout(20) << __func__ <<  ": mds." << gid << ": " << metadata << dendl;
   if (metadata.empty()) {
+    dout(5) << __func__ << ": mds." << gid << ": no metadata!" << dendl;
     return;
   }
   pending_metadata[gid] = metadata;
@@ -1830,7 +1833,6 @@ void MDSMonitor::update_metadata(mds_gid_t gid,
   bufferlist bl;
   encode(pending_metadata, bl);
   t->put(MDS_METADATA_PREFIX, "last_metadata", bl);
-  paxos.trigger_propose();
 }
 
 void MDSMonitor::remove_from_metadata(const FSMap &fsmap, MonitorDBStore::TransactionRef t)
@@ -1969,7 +1971,6 @@ int MDSMonitor::print_nodes(Formatter *f)
  */
 bool MDSMonitor::maybe_resize_cluster(FSMap &fsmap, fs_cluster_id_t fscid)
 {
-  auto &current_mds_map = get_fsmap().get_filesystem(fscid)->mds_map;
   auto&& fs = fsmap.get_filesystem(fscid);
   auto &mds_map = fs->mds_map;
 
@@ -1982,7 +1983,8 @@ bool MDSMonitor::maybe_resize_cluster(FSMap &fsmap, fs_cluster_id_t fscid)
    * current batch of changes in pending. This is important if an MDS is
    * becoming active in the next epoch.
    */
-  if (!current_mds_map.is_resizeable() ||
+  if (!get_fsmap().filesystem_exists(fscid) ||
+      !get_fsmap().get_filesystem(fscid)->mds_map.is_resizeable() ||
       !mds_map.is_resizeable()) {
     dout(5) << __func__ << " mds_map is not currently resizeable" << dendl;
     return false;

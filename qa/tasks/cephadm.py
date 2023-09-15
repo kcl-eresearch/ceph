@@ -141,14 +141,15 @@ def download_cephadm(ctx, config, ref):
         else:
             ctx.cluster.run(
                 args=[
-                    'git', 'archive',
-                    '--remote=' + git_url,
-                    ref,
-                    'src/cephadm/cephadm',
-                    run.Raw('|'),
-                    'tar', '-xO', 'src/cephadm/cephadm',
+                    'git', 'clone', git_url, 'testrepo',
+                    run.Raw('&&'),
+                    'cd', 'testrepo',
+                    run.Raw('&&'),
+                    'git', 'show', f'{ref}:src/cephadm/cephadm',
                     run.Raw('>'),
                     ctx.cephadm,
+                    run.Raw('&&'),
+                    'ls', '-l', ctx.cephadm,
                 ],
             )
         # sanity-check the resulting file and set executable bit
@@ -256,6 +257,7 @@ def ceph_log(ctx, config):
             run.wait(
                 ctx.cluster.run(
                     args=[
+                        'time',
                         'sudo',
                         'find',
                         '/var/log/ceph',   # all logs, not just for the cluster
@@ -266,10 +268,15 @@ def ceph_log(ctx, config):
                         run.Raw('|'),
                         'sudo',
                         'xargs',
+                        '--max-args=1',
+                        '--max-procs=0',
+                        '--verbose',
                         '-0',
                         '--no-run-if-empty',
                         '--',
                         'gzip',
+                        '-5',
+                        '--verbose',
                         '--',
                     ],
                     wait=False,
@@ -816,7 +823,6 @@ def ceph_mdss(ctx, config):
         )
 
     yield
-
 
 @contextlib.contextmanager
 def ceph_monitoring(daemon_type, ctx, config):

@@ -99,6 +99,11 @@ export class RbdFormComponent extends CdForm implements OnInit {
     '16 MiB',
     '32 MiB'
   ];
+
+  defaultStripingUnit = '4 MiB';
+
+  defaultStripingCount = 1;
+
   action: string;
   resource: string;
   private rbdImage = new ReplaySubject(1);
@@ -193,8 +198,8 @@ export class RbdFormComponent extends CdForm implements OnInit {
           validators: [Validators.pattern(/^([0-9]+)d|([0-9]+)h|([0-9]+)m$/)] // check schedule interval to be in format - 1d or 1h or 1m
         }),
         mirroringMode: new FormControl(this.mirroringOptions[0]),
-        stripingUnit: new FormControl(null),
-        stripingCount: new FormControl(null, {
+        stripingUnit: new FormControl(this.defaultStripingUnit),
+        stripingCount: new FormControl(this.defaultStripingCount, {
           updateOn: 'blur'
         })
       },
@@ -437,7 +442,8 @@ export class RbdFormComponent extends CdForm implements OnInit {
         objectSizeControl.value != null ? objectSizeControl.value : this.defaultObjectSize
       );
       const stripingCountControl = formGroup.get('stripingCount');
-      const stripingCount = stripingCountControl.value != null ? stripingCountControl.value : 1;
+      const stripingCount =
+        stripingCountControl.value != null ? stripingCountControl.value : this.defaultStripingCount;
       let sizeControlErrors = null;
       if (sizeControl.value === null) {
         sizeControlErrors = { required: true };
@@ -684,18 +690,17 @@ export class RbdFormComponent extends CdForm implements OnInit {
       }
     });
     request.enable_mirror = this.rbdForm.getValue('mirroring');
-    if (this.poolMirrorMode === 'image') {
-      if (request.enable_mirror) {
+    if (request.enable_mirror) {
+      if (this.rbdForm.getValue('mirroringMode') === 'journal') {
+        request.features.push('journaling');
+      }
+      if (this.poolMirrorMode === 'image') {
         request.mirror_mode = this.rbdForm.getValue('mirroringMode');
       }
     } else {
-      if (request.enable_mirror) {
-        request.features.push('journaling');
-      } else {
-        const index = request.features.indexOf('journaling', 0);
-        if (index > -1) {
-          request.features.splice(index, 1);
-        }
+      const index = request.features.indexOf('journaling', 0);
+      if (index > -1) {
+        request.features.splice(index, 1);
       }
     }
     request.configuration = this.getDirtyConfigurationValues();

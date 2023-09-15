@@ -14,6 +14,7 @@
 
 
 #include "common/dout.h"
+#include "common/likely.h"
 #include "common/HeartbeatMap.h"
 
 #include "include/stringify.h"
@@ -295,6 +296,11 @@ void Beacon::notify_health(MDSRank const *mds)
 
   health.metrics.clear();
 
+  if (unlikely(g_conf().get_val<bool>("mds_inject_health_dummy"))) {
+    MDSHealthMetric m(MDS_HEALTH_DUMMY, HEALTH_ERR, std::string("dummy"));
+    health.metrics.push_back(m);
+  }
+
   // Detect presence of entries in DamageTable
   if (!mds->damage_table.empty()) {
     MDSHealthMetric m(MDS_HEALTH_DAMAGE, HEALTH_ERR, std::string(
@@ -471,6 +477,24 @@ void Beacon::notify_health(MDSRank const *mds)
 
     MDSHealthMetric m(MDS_HEALTH_CACHE_OVERSIZED, HEALTH_WARN, css->strv());
     health.metrics.push_back(m);
+  }
+
+  // Report laggy client(s) due to laggy OSDs
+  {
+    auto&& laggy_clients = mds->server->get_laggy_clients();
+    if (!laggy_clients.empty()) {
+      std::vector<MDSHealthMetric> laggy_clients_metrics;
+      for (const auto& laggy_client: laggy_clients) {
+        CachedStackStringStream css;
+        *css << "Client " << laggy_client << " is laggy; not evicted"
+            << " because some OSD(s) is/are laggy";
+        MDSHealthMetric m(MDS_HEALTH_CLIENTS_LAGGY, HEALTH_WARN, css->strv());
+        laggy_clients_metrics.emplace_back(std::move(m));
+      }
+      auto&& m = laggy_clients_metrics;
+      health.metrics.insert(std::end(health.metrics), std::cbegin(m),
+                            std::cend(m));
+    }
   }
 }
 

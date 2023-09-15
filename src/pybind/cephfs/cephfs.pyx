@@ -1088,7 +1088,8 @@ cdef class LibCephFS(object):
         cdef:
             char* _path = path
             char* _name = name
-        ret = ceph_rmsnap(self.cluster, _path, _name)
+        with nogil:
+            ret = ceph_rmsnap(self.cluster, _path, _name)
         if ret < 0:
             raise make_ex(ret, "rmsnap error")
         return 0
@@ -1107,7 +1108,8 @@ cdef class LibCephFS(object):
         cdef:
             char* _path = path
             snap_info info
-        ret = ceph_get_snap_info(self.cluster, _path, &info)
+        with nogil:
+            ret = ceph_get_snap_info(self.cluster, _path, &info)
         if ret < 0:
             raise make_ex(ret, "snap_info error")
         md = {}
@@ -1269,7 +1271,8 @@ cdef class LibCephFS(object):
         self.require_state("mounted")
         path = cstr(path, 'path')
         cdef char* _path = path
-        ret = ceph_rmdir(self.cluster, _path)
+        with nogil:
+            ret = ceph_rmdir(self.cluster, _path)
         if ret < 0:
             raise make_ex(ret, "error in rmdir {}".format(path.decode('utf-8')))
 
@@ -1901,9 +1904,9 @@ cdef class LibCephFS(object):
 
     def lstat(self, path):
         """
-        Get a file's extended statistics and attributes. When file's a
-        symbolic link, return the informaion of the link itself rather
-        than that of the file it points too.
+        Get a file's extended statistics and attributes. If the file is a
+        symbolic link, return the information of the link itself rather than
+        the information of the file it points to.
 
         :param path: the file or directory to get the statistics of.
         """

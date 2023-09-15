@@ -87,7 +87,7 @@ public:
         f->dump_string("length", len_hex);
         f->close_section();
       };
-      alloc->dump(iterated_allocation);
+      alloc->foreach(iterated_allocation);
       f->close_section();
       f->close_section();
     } else if (command == "bluestore allocator score " + name) {
@@ -109,7 +109,7 @@ public:
 Allocator::Allocator(const std::string& name,
                      int64_t _capacity,
                      int64_t _block_size)
-  : capacity(_capacity), block_size(_block_size)
+  : device_size(_capacity), block_size(_block_size)
 {
   asok_hook = new SocketHook(this, name);
 }
@@ -129,7 +129,7 @@ Allocator *Allocator::create(CephContext* cct, string type,
 {
   Allocator* alloc = nullptr;
   if (type == "stupid") {
-    alloc = new StupidAllocator(cct, name, size, block_size);
+    alloc = new StupidAllocator(cct, size, block_size, name);
   } else if (type == "bitmap") {
     alloc = new BitmapAllocator(cct, size, block_size, name);
   } else if (type == "avl") {
@@ -203,7 +203,7 @@ double Allocator::get_fragmentation_score()
     score_sum += get_score(len);
     sum += len;
   };
-  dump(iterated_allocation);
+  foreach(iterated_allocation);
 
 
   double ideal = get_score(sum);

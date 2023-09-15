@@ -27,6 +27,7 @@ from .fixtures import (
     mock_bad_firewalld,
 )
 
+from pyfakefs import fake_filesystem
 from pyfakefs import fake_filesystem_unittest
 
 with mock.patch('builtins.open', create=True):
@@ -254,6 +255,83 @@ class TestCephAdm(object):
         ctx.skip_firewalld = False
         with pytest.raises(Exception):
             cd.prepare_dashboard(ctx, 0, 0, lambda _, extra_mounts=None, ___=None : '5', lambda : None)
+
+    @mock.patch('cephadm.logger')
+    @mock.patch('cephadm.get_custom_config_files')
+    @mock.patch('cephadm.get_container')
+    def test_get_deployment_container(self, _get_container, _get_config, logger):
+        """
+        test get_deployment_container properly makes use of extra container args and custom conf files
+        """
+
+        ctx = cd.CephadmContext()
+        ctx.config_json = '-'
+        ctx.extra_container_args = [
+            '--pids-limit=12345',
+            '--something',
+        ]
+        ctx.data_dir = 'data'
+        _get_config.return_value = {'custom_config_files': [
+            {
+                'mount_path': '/etc/testing.str',
+                'content': 'this\nis\na\nstring',
+            }
+        ]}
+        _get_container.return_value = cd.CephContainer.for_daemon(
+            ctx,
+            fsid='9b9d7609-f4d5-4aba-94c8-effa764d96c9',
+            daemon_type='grafana',
+            daemon_id='host1',
+            entrypoint='',
+            args=[],
+            container_args=[],
+            volume_mounts={},
+            bind_mounts=[],
+            envs=[],
+            privileged=False,
+            ptrace=False,
+            host_network=True,
+        )
+        c = cd.get_deployment_container(ctx,
+                                    '9b9d7609-f4d5-4aba-94c8-effa764d96c9',
+                                    'grafana',
+                                    'host1',)
+
+        assert '--pids-limit=12345' in c.container_args
+        assert '--something' in c.container_args
+        assert os.path.join('data', '9b9d7609-f4d5-4aba-94c8-effa764d96c9', 'custom_config_files', 'grafana.host1', 'testing.str') in c.volume_mounts
+        assert c.volume_mounts[os.path.join('data', '9b9d7609-f4d5-4aba-94c8-effa764d96c9', 'custom_config_files', 'grafana.host1', 'testing.str')] == '/etc/testing.str'
+
+    @mock.patch('cephadm.logger')
+    @mock.patch('cephadm.get_custom_config_files')
+    def test_write_custom_conf_files(self, _get_config, logger, cephadm_fs):
+        """
+        test _write_custom_conf_files writes the conf files correctly
+        """
+
+        ctx = cd.CephadmContext()
+        ctx.config_json = '-'
+        ctx.data_dir = cd.DATA_DIR
+        _get_config.return_value = {'custom_config_files': [
+            {
+                'mount_path': '/etc/testing.str',
+                'content': 'this\nis\na\nstring',
+            },
+            {
+                'mount_path': '/etc/testing.conf',
+                'content': 'very_cool_conf_setting: very_cool_conf_value\nx: y',
+            },
+            {
+                'mount_path': '/etc/no-content.conf',
+            },
+        ]}
+        cd._write_custom_conf_files(ctx, 'mon', 'host1', 'fsid', 0, 0)
+        with open(os.path.join(cd.DATA_DIR, 'fsid', 'custom_config_files', 'mon.host1', 'testing.str'), 'r') as f:
+            assert 'this\nis\na\nstring' == f.read()
+        with open(os.path.join(cd.DATA_DIR, 'fsid', 'custom_config_files', 'mon.host1', 'testing.conf'), 'r') as f:
+            assert 'very_cool_conf_setting: very_cool_conf_value\nx: y' == f.read()
+        with pytest.raises(FileNotFoundError):
+            open(os.path.join(cd.DATA_DIR, 'fsid', 'custom_config_files', 'mon.host1', 'no-content.conf'), 'r')
 
     @mock.patch('cephadm.call_throws')
     @mock.patch('cephadm.get_parm')
@@ -1095,6 +1173,7 @@ class TestMonitoring(object):
 
     def test_prometheus_external_url(self):
         ctx = cd.CephadmContext()
+        ctx.config_json = json.dumps({'files': {}, 'retention_time': '15d'})
         daemon_type = 'prometheus'
         daemon_id = 'home'
         fsid = 'aaf5a720-13fe-4a3b-82b9-2d99b7fd9704'
@@ -1633,11 +1712,11 @@ if ! grep -qs /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id
 # iscsi tcmu-runner container
 ! /usr/bin/podman rm -f ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi.daemon_id-tcmu 2> /dev/null
 ! /usr/bin/podman rm -f ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id-tcmu 2> /dev/null
-/usr/bin/podman run --rm --ipc=host --stop-signal=SIGTERM --net=host --entrypoint /usr/bin/tcmu-runner --privileged --group-add=disk --init --name ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id-tcmu -e CONTAINER_IMAGE=ceph/ceph -e NODE_NAME=host1 -e CEPH_USE_RANDOM_NONCE=1 -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/config:/etc/ceph/ceph.conf:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/keyring:/etc/ceph/keyring:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/iscsi-gateway.cfg:/etc/ceph/iscsi-gateway.cfg:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/configfs:/sys/kernel/config -v /var/log/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9:/var/log:z -v /dev:/dev --mount type=bind,source=/lib/modules,destination=/lib/modules,ro=true ceph/ceph &
+/usr/bin/podman run --rm --ipc=host --stop-signal=SIGTERM --net=host --entrypoint /usr/bin/tcmu-runner --privileged --group-add=disk --init --name ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id-tcmu --pids-limit=0 -e CONTAINER_IMAGE=ceph/ceph -e NODE_NAME=host1 -e CEPH_USE_RANDOM_NONCE=1 -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/config:/etc/ceph/ceph.conf:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/keyring:/etc/ceph/keyring:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/iscsi-gateway.cfg:/etc/ceph/iscsi-gateway.cfg:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/configfs:/sys/kernel/config -v /var/log/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9:/var/log:z -v /dev:/dev --mount type=bind,source=/lib/modules,destination=/lib/modules,ro=true ceph/ceph &
 # iscsi.daemon_id
 ! /usr/bin/podman rm -f ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi.daemon_id 2> /dev/null
 ! /usr/bin/podman rm -f ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id 2> /dev/null
-/usr/bin/podman run --rm --ipc=host --stop-signal=SIGTERM --net=host --entrypoint /usr/bin/rbd-target-api --privileged --group-add=disk --init --name ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id -e CONTAINER_IMAGE=ceph/ceph -e NODE_NAME=host1 -e CEPH_USE_RANDOM_NONCE=1 -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/config:/etc/ceph/ceph.conf:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/keyring:/etc/ceph/keyring:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/iscsi-gateway.cfg:/etc/ceph/iscsi-gateway.cfg:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/configfs:/sys/kernel/config -v /var/log/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9:/var/log:z -v /dev:/dev --mount type=bind,source=/lib/modules,destination=/lib/modules,ro=true ceph/ceph
+/usr/bin/podman run --rm --ipc=host --stop-signal=SIGTERM --net=host --entrypoint /usr/bin/rbd-target-api --privileged --group-add=disk --init --name ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id --pids-limit=0 -e CONTAINER_IMAGE=ceph/ceph -e NODE_NAME=host1 -e CEPH_USE_RANDOM_NONCE=1 -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/config:/etc/ceph/ceph.conf:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/keyring:/etc/ceph/keyring:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/iscsi-gateway.cfg:/etc/ceph/iscsi-gateway.cfg:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/configfs:/sys/kernel/config -v /var/log/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9:/var/log:z -v /dev:/dev --mount type=bind,source=/lib/modules,destination=/lib/modules,ro=true ceph/ceph
 """
 
     def test_get_container(self):
@@ -2339,10 +2418,49 @@ class TestNetworkValidation:
         with pytest.raises(Exception):
             rc = cd.ip_in_sublets('fe80:2030:31:24', 'fe80::/64')
 
+    @pytest.mark.parametrize("conf", [
+    """[global]
+public_network='1.1.1.0/24,2.2.2.0/24'
+cluster_network="3.3.3.0/24, 4.4.4.0/24"
+""",
+    """[global]
+public_network=" 1.1.1.0/24,2.2.2.0/24 "
+cluster_network=3.3.3.0/24, 4.4.4.0/24
+""",
+    """[global]
+    public_network= 1.1.1.0/24,  2.2.2.0/24 
+    cluster_network='3.3.3.0/24,4.4.4.0/24'
+"""])
+    @mock.patch('cephadm.list_networks')
+    def test_get_networks_from_conf(self, _list_networks, conf, cephadm_fs):
+        cephadm_fs.create_file('ceph.conf', contents=conf)
+        _list_networks.return_value = {'1.1.1.0/24': {'eth0': ['1.1.1.1']},
+                                       '2.2.2.0/24': {'eth1': ['2.2.2.2']},
+                                       '3.3.3.0/24': {'eth2': ['3.3.3.3']},
+                                       '4.4.4.0/24': {'eth3': ['4.4.4.4']}}
+        ctx = cd.CephadmContext()
+        ctx.config = 'ceph.conf'
+        ctx.mon_ip = '1.1.1.1'
+        ctx.cluster_network = None
+        # what the cephadm module does with the public network string is
+        # [x.strip() for x in out.split(',')]
+        # so we must make sure our output, through that alteration,
+        # generates correctly formatted networks
+        def _str_to_networks(s):
+            return [x.strip() for x in s.split(',')]
+        public_network = cd.get_public_net_from_cfg(ctx)
+        assert _str_to_networks(public_network) == ['1.1.1.0/24', '2.2.2.0/24']
+        cluster_network, ipv6 = cd.prepare_cluster_network(ctx)
+        assert not ipv6
+        assert _str_to_networks(cluster_network) == ['3.3.3.0/24', '4.4.4.0/24']
+
 class TestRescan(fake_filesystem_unittest.TestCase):
 
     def setUp(self):
         self.setUpPyfakefs()
+        if not fake_filesystem.is_root():
+            fake_filesystem.set_uid(0)
+
         self.fs.create_dir('/sys/class')
         self.ctx = cd.CephadmContext()
         self.ctx.func = cd.command_rescan_disks

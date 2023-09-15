@@ -571,12 +571,14 @@ class Orchestrator(object):
     def remove_osds(self, osd_ids: List[str],
                     replace: bool = False,
                     force: bool = False,
-                    zap: bool = False) -> OrchResult[str]:
+                    zap: bool = False,
+                    no_destroy: bool = False) -> OrchResult[str]:
         """
         :param osd_ids: list of OSD IDs
         :param replace: marks the OSD as being destroyed. See :ref:`orchestrator-osd-replace`
         :param force: Forces the OSD removal process without waiting for the data to be drained first.
         :param zap: Zap/Erase all devices associated with the OSDs (DESTROYS DATA)
+        :param no_destroy: Do not destroy associated VGs/LVs with the OSD.
 
         .. note:: this can only remove OSDs that were successfully
             created (i.e. got an OSD ID).
@@ -861,6 +863,7 @@ class DaemonDescription(object):
                  rank: Optional[int] = None,
                  rank_generation: Optional[int] = None,
                  extra_container_args: Optional[List[str]] = None,
+                 extra_entrypoint_args: Optional[List[str]] = None,
                  ) -> None:
 
         #: Host is at the same granularity as InventoryHost
@@ -926,6 +929,7 @@ class DaemonDescription(object):
         self.is_active = is_active
 
         self.extra_container_args = extra_container_args
+        self.extra_entrypoint_args = extra_entrypoint_args
 
     @property
     def status(self) -> Optional[DaemonDescriptionStatus]:

@@ -77,6 +77,15 @@ enum {
   l_c_wrlat,
   l_c_read,
   l_c_fsync,
+  l_c_md_avg,
+  l_c_md_sqsum,
+  l_c_md_ops,
+  l_c_rd_avg,
+  l_c_rd_sqsum,
+  l_c_rd_ops,
+  l_c_wr_avg,
+  l_c_wr_sqsum,
+  l_c_wr_ops,
   l_c_last,
 };
 
@@ -892,6 +901,7 @@ public:
   bool _collect_and_send_global_metrics;
 
 protected:
+  std::list<ceph::condition_variable*> waiting_for_reclaim;
   /* Flags for check_caps() */
   static const unsigned CHECK_CAPS_NODELAY = 0x1;
   static const unsigned CHECK_CAPS_SYNCHRONOUS = 0x2;
@@ -925,8 +935,9 @@ protected:
   void dump_mds_sessions(Formatter *f, bool cap_dump=false);
 
   int make_request(MetaRequest *req, const UserPerm& perms,
-		   InodeRef *ptarget = 0, bool *pcreated = 0,
-		   mds_rank_t use_mds=-1, bufferlist *pdirbl=0);
+                   InodeRef *ptarget = 0, bool *pcreated = 0,
+                   mds_rank_t use_mds=-1, bufferlist *pdirbl=0,
+                   size_t feature_needed=ULONG_MAX);
   void put_request(MetaRequest *request);
   void unregister_request(MetaRequest *request);
 
@@ -944,7 +955,7 @@ protected:
   void connect_mds_targets(mds_rank_t mds);
   void send_request(MetaRequest *request, MetaSession *session,
 		    bool drop_cap_releases=false);
-  MRef<MClientRequest> build_client_request(MetaRequest *request);
+  MRef<MClientRequest> build_client_request(MetaRequest *request, mds_rank_t mds);
   void kick_requests(MetaSession *session);
   void kick_requests_closed(MetaSession *session);
   void handle_client_request_forward(const MConstRef<MClientRequestForward>& reply);
@@ -973,6 +984,7 @@ protected:
   void update_snap_trace(const bufferlist& bl, SnapRealm **realm_ret, bool must_flush=true);
   void invalidate_snaprealm_and_children(SnapRealm *realm);
 
+  void refresh_snapdir_attrs(Inode *in, Inode *diri);
   Inode *open_snapdir(Inode *diri);
 
   int get_fd() {
@@ -1305,7 +1317,8 @@ private:
 		 const UserPerm& perms);
 
   int _lookup(Inode *dir, const string& dname, int mask, InodeRef *target,
-	      const UserPerm& perm, std::string* alternate_name=nullptr);
+	      const UserPerm& perm, std::string* alternate_name=nullptr,
+              bool is_rename=false);
 
   int _link(Inode *in, Inode *dir, const char *name, const UserPerm& perm, std::string alternate_name,
 	    InodeRef *inp = 0);
@@ -1373,6 +1386,7 @@ private:
   int _fsync(Fh *fh, bool syncdataonly);
   int _fsync(Inode *in, bool syncdataonly);
   int _sync_fs();
+  int clear_suid_sgid(Inode *in, const UserPerm& perms, bool defer=false);
   int _fallocate(Fh *fh, int mode, int64_t offset, int64_t length);
   int _getlk(Fh *fh, struct flock *fl, uint64_t owner);
   int _setlk(Fh *fh, struct flock *fl, uint64_t owner, int sleep);
@@ -1455,6 +1469,10 @@ private:
 
   void collect_and_send_metrics();
   void collect_and_send_global_metrics();
+
+  void update_io_stat_metadata(utime_t latency);
+  void update_io_stat_read(utime_t latency);
+  void update_io_stat_write(utime_t latency);
 
   uint32_t deleg_timeout = 0;
 
@@ -1546,10 +1564,11 @@ private:
   std::map<std::pair<int64_t,std::string>, int> pool_perms;
   std::list<ceph::condition_variable*> waiting_for_pool_perm;
 
+  std::list<ceph::condition_variable*> waiting_for_rename;
+
   uint64_t retries_on_invalidate = 0;
 
   // state reclaim
-  std::list<ceph::condition_variable*> waiting_for_reclaim;
   int reclaim_errno = 0;
   epoch_t reclaim_osd_epoch = 0;
   entity_addrvec_t reclaim_target_addrs;
@@ -1574,6 +1593,10 @@ private:
 
   ceph::spinlock delay_i_lock;
   std::map<Inode*,int> delay_i_release;
+
+  uint64_t nr_metadata_request = 0;
+  uint64_t nr_read_request = 0;
+  uint64_t nr_write_request = 0;
 };
 
 /**

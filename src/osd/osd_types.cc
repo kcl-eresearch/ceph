@@ -5125,7 +5125,8 @@ static void _handle_dups(CephContext* cct, pg_log_t &target, const pg_log_t &oth
 {
   auto earliest_dup_version =
 	        target.head.version < maxdups ? 0u : target.head.version - maxdups + 1;
-  lgeneric_subdout(cct, osd, 20) << "copy_up_to/copy_after earliest_dup_version " << earliest_dup_version << dendl;
+  lgeneric_subdout(cct, osd, 20) << __func__ << " earliest_dup_version "
+				 << earliest_dup_version << dendl;
 
   for (auto d = other.dups.cbegin(); d != other.dups.cend(); ++d) {
     if (d->version.version >= earliest_dup_version) {
@@ -5155,7 +5156,9 @@ void pg_log_t::copy_after(CephContext* cct, const pg_log_t &other, eversion_t v)
   can_rollback_to = other.can_rollback_to;
   head = other.head;
   tail = other.tail;
-  lgeneric_subdout(cct, osd, 20) << __func__ << " v " << v << dendl;
+  lgeneric_subdout(cct, osd, 20) << __func__ << " v " << v
+				 << " dups.size()=" << dups.size()
+				 << " other.dups.size()=" << other.dups.size() << dendl;
   for (auto i = other.log.crbegin(); i != other.log.crend(); ++i) {
     ceph_assert(i->version > other.tail);
     if (i->version <= v) {
@@ -5167,6 +5170,9 @@ void pg_log_t::copy_after(CephContext* cct, const pg_log_t &other, eversion_t v)
     log.push_front(*i);
   }
   _handle_dups(cct, *this, other, cct->_conf->osd_pg_log_dups_tracked);
+  lgeneric_subdout(cct, osd, 20) << __func__ << " END v " << v
+				 << " dups.size()=" << dups.size()
+				 << " other.dups.size()=" << other.dups.size() << dendl;
 }
 
 void pg_log_t::copy_up_to(CephContext* cct, const pg_log_t &other, int max)
@@ -5175,7 +5181,9 @@ void pg_log_t::copy_up_to(CephContext* cct, const pg_log_t &other, int max)
   int n = 0;
   head = other.head;
   tail = other.tail;
-  lgeneric_subdout(cct, osd, 20) << __func__ << " max " << max << dendl;
+  lgeneric_subdout(cct, osd, 20) << __func__ << " max " << max
+				<< " dups.size()=" << dups.size()
+				<< " other.dups.size()=" << other.dups.size() << dendl;
   for (auto i = other.log.crbegin(); i != other.log.crend(); ++i) {
     ceph_assert(i->version > other.tail);
     if (n++ >= max) {
@@ -5186,6 +5194,9 @@ void pg_log_t::copy_up_to(CephContext* cct, const pg_log_t &other, int max)
     log.push_front(*i);
   }
   _handle_dups(cct, *this, other, cct->_conf->osd_pg_log_dups_tracked);
+  lgeneric_subdout(cct, osd, 20) << __func__ << " END max " << max
+				 << " dups.size()=" << dups.size()
+				 << " other.dups.size()=" << other.dups.size() << dendl;
 }
 
 ostream& pg_log_t::print(ostream& out) const
@@ -5556,7 +5567,7 @@ void pg_hit_set_history_t::generate_test_instances(list<pg_hit_set_history_t*>& 
 
 void OSDSuperblock::encode(ceph::buffer::list &bl) const
 {
-  ENCODE_START(9, 5, bl);
+  ENCODE_START(10, 5, bl);
   encode(cluster_fsid, bl);
   encode(whoami, bl);
   encode(current_epoch, bl);
@@ -5571,12 +5582,13 @@ void OSDSuperblock::encode(ceph::buffer::list &bl) const
   encode((uint32_t)0, bl);  // map<int64_t,epoch_t> pool_last_epoch_marked_full
   encode(purged_snaps_last, bl);
   encode(last_purged_snaps_scrub, bl);
+  encode(cluster_osdmap_trim_lower_bound, bl);
   ENCODE_FINISH(bl);
 }
 
 void OSDSuperblock::decode(ceph::buffer::list::const_iterator &bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(9, 5, 5, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(10, 5, 5, bl);
   if (struct_v < 3) {
     string magic;
     decode(magic, bl);
@@ -5610,6 +5622,11 @@ void OSDSuperblock::decode(ceph::buffer::list::const_iterator &bl)
   } else {
     purged_snaps_last = 0;
   }
+  if (struct_v >= 10) {
+    decode(cluster_osdmap_trim_lower_bound, bl);
+  } else {
+    cluster_osdmap_trim_lower_bound = 0;
+  }
   DECODE_FINISH(bl);
 }
 
@@ -5629,6 +5646,8 @@ void OSDSuperblock::dump(Formatter *f) const
   f->dump_int("last_epoch_mounted", mounted);
   f->dump_unsigned("purged_snaps_last", purged_snaps_last);
   f->dump_stream("last_purged_snaps_scrub") << last_purged_snaps_scrub;
+  f->dump_int("cluster_osdmap_trim_lower_bound",
+              cluster_osdmap_trim_lower_bound);
 }
 
 void OSDSuperblock::generate_test_instances(list<OSDSuperblock*>& o)

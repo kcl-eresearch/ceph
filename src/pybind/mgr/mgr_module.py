@@ -1075,6 +1075,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
             addrs = self._rados.get_addrs()
             self._rados.shutdown()
             self._ceph_unregister_client(addrs)
+            self._rados = None
 
     @API.expose
     def get(self, data_name: str) -> Any:
@@ -1303,7 +1304,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         :rtype: dict, or None if no metadata found
         """
         metadata = self._ceph_get_metadata(svc_type, svc_id)
-        if metadata is None:
+        if not metadata:
             return default
         return metadata
 
@@ -1962,6 +1963,13 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         :param int query_id: query ID
         """
         return self._ceph_get_mds_perf_counters(query_id)
+
+    def get_daemon_health_metrics(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Get the list of health metrics per daemon. This includes SLOW_OPS health metrics
+        in MON and OSD daemons, and PENDING_CREATING_PGS health metrics for OSDs.
+        """
+        return self._ceph_get_daemon_health_metrics()
 
     def is_authorized(self, arguments: Dict[str, str]) -> bool:
         """

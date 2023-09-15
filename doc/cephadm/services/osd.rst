@@ -301,13 +301,14 @@ Expected output::
 
 This resets the initial state of the OSD and takes it off the removal queue.
 
+.. _cephadm-replacing-an-osd:
 
 Replacing an OSD
 ----------------
 
 .. prompt:: bash #
 
-  orch osd rm <osd_id(s)> --replace [--force]
+  ceph orch osd rm <osd_id(s)> --replace [--force]
 
 Example:
 

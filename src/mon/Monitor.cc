@@ -950,7 +950,15 @@ int Monitor::init()
   mgrmon()->prime_mgr_client();
 
   state = STATE_PROBING;
+
   bootstrap();
+
+  if (!elector.peer_tracker_is_clean()){
+    dout(10) << "peer_tracker looks inconsistent"
+      << " previous bad logic, clearing ..." << dendl;
+    elector.notify_clear_peer_state();
+  }
+
   // add features of myself into feature_map
   session_map.feature_map.add_mon(con_self->get_features());
   return 0;
@@ -2004,10 +2012,16 @@ void Monitor::handle_probe_reply(MonOpRequestRef op)
 			       !has_ever_joined)) {
       dout(10) << " got newer/committed monmap epoch " << newmap->get_epoch()
 	       << ", mine was " << monmap->get_epoch() << dendl;
+      int epoch_diff = newmap->get_epoch() - monmap->get_epoch();
       delete newmap;
       monmap->decode(m->monmap_bl);
-      notify_new_monmap(false);
-
+      dout(20) << "has_ever_joined: " << has_ever_joined << dendl;
+      if (epoch_diff == 1 && has_ever_joined) {
+        notify_new_monmap(false);
+      } else {
+        notify_new_monmap(false, false);
+        elector.notify_clear_peer_state();
+      }
       bootstrap();
       return;
     }
@@ -2966,6 +2980,19 @@ void Monitor::log_health(
   }
 }
 
+void Monitor::update_pending_metadata()
+{
+  Metadata metadata;
+  collect_metadata(&metadata);
+  size_t version_size = mon_metadata[rank]["ceph_version_short"].size();
+  const std::string current_version = mon_metadata[rank]["ceph_version_short"];
+  const std::string pending_version = metadata["ceph_version_short"];
+
+  if (current_version.compare(0, version_size, pending_version) != 0) {
+    mgr_client.update_daemon_metadata("mon", name, metadata);
+  }
+}
+
 void Monitor::get_cluster_status(stringstream &ss, Formatter *f,
 				 MonSession *session)
 {
@@ -3430,9 +3457,9 @@ void Monitor::handle_command(MonOpRequestRef op)
   // Catch bad_cmd_get exception if _generate_command_map() throws it
   try {
     _generate_command_map(cmdmap, param_str_map);
-  }
-  catch(bad_cmd_get& e) {
+  } catch (const bad_cmd_get& e) {
     reply_command(op, -EINVAL, e.what(), 0);
+    return;
   }
 
   if (!_allowed_command(session, service, prefix, cmdmap,
@@ -3665,7 +3692,16 @@ void Monitor::handle_command(MonOpRequestRef op)
     rs = "";
     r = 0;
   } else if (prefix == "report") {
-
+    // some of the report data is only known by leader, e.g. osdmap_clean_epochs
+    if (!is_leader() && !is_peon()) {
+      dout(10) << " waiting for quorum" << dendl;
+      waitfor_quorum.push_back(new C_RetryMessage(this, op));
+      return;
+    }
+    if (!is_leader()) {
+      forward_request_leader(op);
+      return;
+    }
     // this must be formatted, in its current form
     if (!f)
       f.reset(Formatter::create("json-pretty"));
@@ -6316,7 +6352,7 @@ int Monitor::handle_auth_request(
       &auth_meta->connection_secret,
       &auth_meta->authorizer_challenge);
     if (isvalid) {
-      ms_handle_authentication(con);
+      ms_handle_fast_authentication(con);
       return 1;
     }
     if (!more && !was_challenge && auth_meta->authorizer_challenge) {
@@ -6437,7 +6473,7 @@ int Monitor::handle_auth_request(
   }
   if (r > 0 &&
       !s->authenticated) {
-    ms_handle_authentication(con);
+    ms_handle_fast_authentication(con);
   }
 
   dout(30) << " r " << r << " reply:\n";
@@ -6475,7 +6511,7 @@ void Monitor::ms_handle_accept(Connection *con)
   }
 }
 
-int Monitor::ms_handle_authentication(Connection *con)
+int Monitor::ms_handle_fast_authentication(Connection *con)
 {
   if (con->get_peer_type() == CEPH_ENTITY_TYPE_MON) {
     // mon <-> mon connections need no Session, and setting one up
@@ -6545,7 +6581,7 @@ void Monitor::set_mon_crush_location(const string& loc)
   need_set_crush_loc = true;
 }
 
-void Monitor::notify_new_monmap(bool can_change_external_state)
+void Monitor::notify_new_monmap(bool can_change_external_state, bool remove_rank_elector)
 {
   if (need_set_crush_loc) {
     auto my_info_i = monmap->mon_info.find(name);
@@ -6555,12 +6591,25 @@ void Monitor::notify_new_monmap(bool can_change_external_state)
     }
   }
   elector.notify_strategy_maybe_changed(monmap->strategy);
-  dout(30) << __func__ << "we have " << monmap->removed_ranks.size() << " removed ranks" << dendl;
-  for (auto i = monmap->removed_ranks.rbegin();
-       i != monmap->removed_ranks.rend(); ++i) {
-    int rank = *i;
-    dout(10) << __func__ << "removing rank " << rank << dendl;
-    elector.notify_rank_removed(rank);
+  if (remove_rank_elector){
+    dout(10) << __func__ << " we have " << monmap->ranks.size()<< " ranks" << dendl;
+    dout(10) << __func__ << " we have " << monmap->removed_ranks.size() << " removed ranks" << dendl;
+    for (auto i = monmap->removed_ranks.rbegin();
+        i != monmap->removed_ranks.rend(); ++i) {
+      int remove_rank = *i;
+      dout(10) << __func__ << " removing rank " << remove_rank << dendl;
+      if (rank == remove_rank) {
+        dout(5) << "We are removing our own rank, probably we"
+          << " are removed from monmap before we shutdown ... dropping." << dendl;
+        continue;
+      }
+      int new_rank = monmap->get_rank(messenger->get_myaddrs());
+      if (new_rank == -1) {
+        dout(5) << "We no longer exists in the monmap! ... dropping." << dendl;
+        continue;
+      }
+      elector.notify_rank_removed(remove_rank, new_rank);
+    }
   }
 
   if (monmap->stretch_mode_enabled) {

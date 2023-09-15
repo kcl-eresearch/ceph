@@ -1,6 +1,6 @@
 import cherrypy
 from collections import defaultdict
-from distutils.version import StrictVersion
+from pkg_resources import packaging  # type: ignore
 import json
 import math
 import os
@@ -32,10 +32,11 @@ DEFAULT_PORT = 9283
 # ipv6 isn't yet configured / supported and CherryPy throws an uncaught
 # exception.
 if cherrypy is not None:
-    v = StrictVersion(cherrypy.__version__)
+    Version = packaging.version.Version
+    v = Version(cherrypy.__version__)
     # the issue was fixed in 3.2.3. it's present in 3.2.2 (current version on
     # centos:7) and back to at least 3.0.0.
-    if StrictVersion("3.1.2") <= v < StrictVersion("3.2.3"):
+    if Version("3.1.2") <= v < Version("3.2.3"):
         # https://github.com/cherrypy/cherrypy/issues/1100
         from cherrypy.process import servers
         servers.wait_for_occupied_port = lambda host, port: None
@@ -971,11 +972,11 @@ class Module(MgrModule):
         for mon in mon_status['monmap']['mons']:
             rank = mon['rank']
             id_ = mon['name']
-            host_version = servers.get((id_, 'mon'), ('', '', ''))
+            mon_version = servers.get((id_, 'mon'), ('', '', ''))
             self.metrics['mon_metadata'].set(1, (
-                'mon.{}'.format(id_), host_version[0],
+                'mon.{}'.format(id_), mon_version[0],
                 mon['public_addr'].rsplit(':', 1)[0], rank,
-                host_version[1]
+                mon_version[1]
             ))
             in_quorum = int(rank in mon_status['quorum'])
             self.metrics['mon_quorum_status'].set(in_quorum, (
@@ -1031,7 +1032,9 @@ class Module(MgrModule):
         pg_summary = self.get('pg_summary')
 
         for pool in pg_summary['by_pool']:
-            num_by_state = defaultdict(int)  # type: DefaultDict[str, int]
+            num_by_state: DefaultDict[str, int] = defaultdict(int)
+            for state in PG_STATES:
+                num_by_state[state] = 0
 
             for state_name, count in pg_summary['by_pool'][pool].items():
                 for state in state_name.split('+'):
@@ -1058,10 +1061,11 @@ class Module(MgrModule):
     def get_service_list(self) -> Dict[Tuple[str, str], Tuple[str, str, str]]:
         ret = {}
         for server in self.list_servers():
-            version = cast(str, server.get('ceph_version', ''))
             host = cast(str, server.get('hostname', ''))
             for service in cast(List[ServiceInfoT], server.get('services', [])):
-                ret.update({(service['id'], service['type']): (host, version, service.get('name', ''))})
+                ret.update({(service['id'], service['type']): (host,
+                                                               service.get('ceph_version', 'unknown'),
+                                                               service.get('name', ''))})
         return ret
 
     @profile_method()
@@ -1099,7 +1103,7 @@ class Module(MgrModule):
                               "skipping output".format(id_))
                 continue
 
-            host_version = servers.get((str(id_), 'osd'), ('', '', ''))
+            osd_version = servers.get((str(id_), 'osd'), ('', '', ''))
 
             # collect disk occupation metadata
             osd_metadata = self.get_metadata("osd", str(id_))
@@ -1116,10 +1120,10 @@ class Module(MgrModule):
                 c_addr,
                 dev_class,
                 f_iface,
-                host_version[0],
+                osd_version[0],
                 obj_store,
                 p_addr,
-                host_version[1]
+                osd_version[1]
             ))
 
             # collect osd status
@@ -1551,6 +1555,35 @@ class Module(MgrModule):
                 cast(MetricCounter, sum_metric).add(duration, (method_name,))
                 cast(MetricCounter, count_metric).add(1, (method_name,))
 
+    def get_pg_repaired_objects(self) -> None:
+        dump = self.get('pg_dump')
+        for stats in dump['pool_stats']:
+            path = f'pg_objects_repaired{stats["poolid"]}'
+            self.metrics[path] = Metric(
+                'counter',
+                'pg_objects_repaired',
+                'Number of objects repaired in a pool Count',
+                ('poolid',)
+            )
+
+            self.metrics[path].set(stats['stat_sum']['num_objects_repaired'],
+                                   labelvalues=(stats['poolid'],))
+
+    def get_all_daemon_health_metrics(self) -> None:
+        daemon_metrics = self.get_daemon_health_metrics()
+        self.log.debug('metrics jeje %s' % (daemon_metrics))
+        for daemon_name, health_metrics in daemon_metrics.items():
+            for health_metric in health_metrics:
+                path = f'daemon_health_metrics{daemon_name}{health_metric["type"]}'
+                self.metrics[path] = Metric(
+                    'counter',
+                    'daemon_health_metrics',
+                    'Health metrics for Ceph daemons',
+                    ('type', 'ceph_daemon',)
+                )
+                self.metrics[path].set(health_metric['value'], labelvalues=(
+                    health_metric['type'], daemon_name,))
+
     @profile_method(True)
     def collect(self) -> str:
         # Clear the metrics before scraping
@@ -1566,7 +1599,9 @@ class Module(MgrModule):
         self.get_mgr_status()
         self.get_metadata_and_osd_status()
         self.get_pg_status()
+        self.get_pg_repaired_objects()
         self.get_num_objects()
+        self.get_all_daemon_health_metrics()
 
         for daemon, counters in self.get_all_perf_counters().items():
             for path, counter_info in counters.items():

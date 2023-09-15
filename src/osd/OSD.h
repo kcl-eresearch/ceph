@@ -149,7 +149,6 @@ public:
 
   int get_nodeid() const { return whoami; }
 
-  std::atomic<epoch_t> max_oldest_map;
 private:
   OSDMapRef osdmap;
 
@@ -1573,7 +1572,7 @@ public:
     bool ms_handle_refused(Connection *con) override {
       return osd->ms_handle_refused(con);
     }
-    int ms_handle_authentication(Connection *con) override {
+    int ms_handle_fast_authentication(Connection *con) override {
       return true;
     }
   } heartbeat_dispatcher;
@@ -2034,7 +2033,7 @@ private:
   void ms_handle_connect(Connection *con) override;
   void ms_handle_fast_connect(Connection *con) override;
   void ms_handle_fast_accept(Connection *con) override;
-  int ms_handle_authentication(Connection *con) override;
+  int ms_handle_fast_authentication(Connection *con) override;
   bool ms_handle_reset(Connection *con) override;
   void ms_handle_remote_reset(Connection *con) override {}
   bool ms_handle_refused(Connection *con) override;

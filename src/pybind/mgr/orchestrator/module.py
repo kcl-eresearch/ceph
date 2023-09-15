@@ -8,13 +8,13 @@ import datetime
 import yaml
 from prettytable import PrettyTable
 
-from ceph.deployment.inventory import Device
+from ceph.deployment.inventory import Device  # noqa: F401; pylint: disable=unused-variable
 from ceph.deployment.drive_group import DriveGroupSpec, DeviceSelection, OSDMethod
 from ceph.deployment.service_spec import PlacementSpec, ServiceSpec, service_spec_allow_invalid_from_json
 from ceph.deployment.hostspec import SpecValidationError
 from ceph.utils import datetime_now
 
-from mgr_util import to_pretty_timedelta, format_dimless, format_bytes
+from mgr_util import to_pretty_timedelta, format_bytes
 from mgr_module import MgrModule, HandleCommandResult, Option
 
 from ._interface import OrchestratorClientMixin, DeviceLightLoc, _cli_read_command, \
@@ -216,8 +216,8 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super(OrchestratorCli, self).__init__(*args, **kwargs)
-        self.ident = set()  # type: Set[str]
-        self.fault = set()  # type: Set[str]
+        self.ident: Set[str] = set()
+        self.fault: Set[str] = set()
         self._load()
         self._refresh_health()
 
@@ -536,7 +536,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
                                 d.lsm_data.get('transport', ''),
                                 d.lsm_data.get('rpm', ''),
                                 d.device_id,
-                                format_dimless(d.sys_api.get('size', 0), 5),
+                                format_bytes(d.sys_api.get('size', 0), 5),
                                 d.lsm_data.get('health', ''),
                                 display_map[led_ident],
                                 display_map[led_fail],
@@ -552,7 +552,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
                                 d.path,
                                 d.human_readable_type,
                                 d.device_id,
-                                format_dimless(d.sys_api.get('size', 0), 5),
+                                format_bytes(d.sys_api.get('size', 0), 5),
                                 display_map[d.available],
                                 nice_delta(now, d.created, ' ago'),
                                 ', '.join(d.rejected_reasons)
@@ -846,9 +846,11 @@ Usage:
                       osd_id: List[str],
                       replace: bool = False,
                       force: bool = False,
-                      zap: bool = False) -> HandleCommandResult:
+                      zap: bool = False,
+                      no_destroy: bool = False) -> HandleCommandResult:
         """Remove OSD daemons"""
-        completion = self.remove_osds(osd_id, replace=replace, force=force, zap=zap)
+        completion = self.remove_osds(osd_id, replace=replace, force=force,
+                                      zap=zap, no_destroy=no_destroy)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
@@ -1418,7 +1420,7 @@ Usage:
 
     @_cli_write_command('orch upgrade status')
     def _upgrade_status(self) -> HandleCommandResult:
-        """Check service versions vs available and target containers"""
+        """Check the status of any potential ongoing upgrade operation"""
         completion = self.upgrade_status()
         status = raise_if_exception(completion)
         r = {

@@ -796,6 +796,8 @@ public:
     const health_check_map_t& previous,
     MonitorDBStore::TransactionRef t);
 
+  void update_pending_metadata();
+
 protected:
 
   class HealthCheckLogStatus {
@@ -874,7 +876,7 @@ public:
   /** can_change_external_state if we can do things like
    *  call elections as a result of the new map.
    */
-  void notify_new_monmap(bool can_change_external_state=false);
+  void notify_new_monmap(bool can_change_external_state=false, bool remove_rank_elector=true);
 
 public:
   struct C_Command : public C_MonOp {
@@ -955,7 +957,7 @@ public:
   MonCap mon_caps;
   bool get_authorizer(int dest_type, AuthAuthorizer **authorizer);
 public: // for AuthMonitor msgr1:
-  int ms_handle_authentication(Connection *con) override;
+  int ms_handle_fast_authentication(Connection *con) override;
 private:
   void ms_handle_accept(Connection *con) override;
   bool ms_handle_reset(Connection *con) override;

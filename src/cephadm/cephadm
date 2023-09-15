@@ -31,7 +31,7 @@ from contextlib import redirect_stdout
 import ssl
 from enum import Enum
 
-from typing import Dict, List, Tuple, Optional, Union, Any, NoReturn, Callable, IO, Sequence, TypeVar, cast, Set, Iterable
+from typing import Dict, List, Tuple, Optional, Union, Any, NoReturn, Callable, IO, Sequence, TypeVar, cast, Set, Iterable, TextIO
 
 import re
 import uuid
@@ -73,6 +73,7 @@ DATA_DIR_MODE = 0o700
 CONTAINER_INIT = True
 MIN_PODMAN_VERSION = (2, 0, 2)
 CGROUPS_SPLIT_PODMAN_VERSION = (2, 1, 0)
+PIDS_LIMIT_UNLIMITED_PODMAN_VERSION = (3, 4, 1)
 CUSTOM_PS1 = r'[ceph: \u@\h \W]\$ '
 DEFAULT_TIMEOUT = None  # in seconds
 DEFAULT_RETRY = 15
@@ -293,6 +294,7 @@ class UnauthorizedRegistryError(Error):
 class Ceph(object):
     daemons = ('mon', 'mgr', 'mds', 'osd', 'rgw', 'rbd-mirror',
                'crash', 'cephfs-mirror')
+    gateways = ('iscsi', 'nfs')
 
 ##################################
 
@@ -524,10 +526,11 @@ class Monitoring(object):
         cmd = daemon_type.replace('-', '_')
         code = -1
         err = ''
+        out = ''
         version = ''
         if daemon_type == 'alertmanager':
             for cmd in ['alertmanager', 'prometheus-alertmanager']:
-                _, err, code = call(ctx, [
+                out, err, code = call(ctx, [
                     ctx.container_engine.path, 'exec', container_id, cmd,
                     '--version'
                 ], verbosity=CallVerbosity.DEBUG)
@@ -535,12 +538,14 @@ class Monitoring(object):
                     break
             cmd = 'alertmanager'  # reset cmd for version extraction
         else:
-            _, err, code = call(ctx, [
+            out, err, code = call(ctx, [
                 ctx.container_engine.path, 'exec', container_id, cmd, '--version'
             ], verbosity=CallVerbosity.DEBUG)
-        if code == 0 and \
-                err.startswith('%s, version ' % cmd):
-            version = err.split(' ')[2]
+        if code == 0:
+            if err.startswith('%s, version ' % cmd):
+                version = err.split(' ')[2]
+            elif out.startswith('%s, version ' % cmd):
+                version = out.split(' ')[2]
         return version
 
 ##################################
@@ -824,6 +829,7 @@ class CephIscsi(object):
         # remove extra container args for tcmu container.
         # extra args could cause issue with forking service type
         tcmu_container.container_args = []
+        set_pids_limit_unlimited(self.ctx, tcmu_container.container_args)
         return tcmu_container
 
 ##################################
@@ -909,8 +915,9 @@ class HAproxy(object):
     @staticmethod
     def get_sysctl_settings() -> List[str]:
         return [
-            '# IP forwarding',
+            '# IP forwarding and non-local bind',
             'net.ipv4.ip_forward = 1',
+            'net.ipv4.ip_nonlocal_bind = 1',
         ]
 
 ##################################
@@ -1800,6 +1807,15 @@ def get_fqdn():
     return socket.getfqdn() or socket.gethostname()
 
 
+def get_ip_addresses(hostname: str) -> Tuple[List[str], List[str]]:
+    items = socket.getaddrinfo(hostname, None,
+                               flags=socket.AI_CANONNAME,
+                               type=socket.SOCK_STREAM)
+    ipv4_addresses = [i[4][0] for i in items if i[0] == socket.AF_INET]
+    ipv6_addresses = [i[4][0] for i in items if i[0] == socket.AF_INET6]
+    return ipv4_addresses, ipv6_addresses
+
+
 def get_arch():
     # type: () -> str
     return platform.uname().machine
@@ -2376,8 +2392,20 @@ def get_daemon_args(ctx, fsid, daemon_type, daemon_id):
                     port = meta['ports'][0]
             r += [f'--web.listen-address={ip}:{port}']
             if daemon_type == 'prometheus':
+                config = get_parm(ctx.config_json)
+                retention_time = config.get('retention_time', '15d')
+                retention_size = config.get('retention_size', '0')  # default to disabled
+                r += [f'--storage.tsdb.retention.time={retention_time}']
+                r += [f'--storage.tsdb.retention.size={retention_size}']
                 scheme = 'http'
                 host = get_fqdn()
+                # in case host is not an fqdn then we use the IP to
+                # avoid producing a broken web.external-url link
+                if '.' not in host:
+                    ipv4_addrs, ipv6_addrs = get_ip_addresses(get_hostname())
+                    # use the first ipv4 (if any) otherwise use the first ipv6
+                    addr = next(iter(ipv4_addrs or ipv6_addrs), None)
+                    host = wrap_ipv6(addr) if addr else host
                 r += [f'--web.external-url={scheme}://{host}:{port}']
         if daemon_type == 'alertmanager':
             config = get_parm(ctx.config_json)
@@ -2498,10 +2526,46 @@ def create_daemon_dirs(ctx, fsid, daemon_type, daemon_id, uid, gid,
         sg = SNMPGateway.init(ctx, fsid, daemon_id)
         sg.create_daemon_conf()
 
+    _write_custom_conf_files(ctx, daemon_type, str(daemon_id), fsid, uid, gid)
 
-def get_parm(option):
-    # type: (str) -> Dict[str, str]
 
+def _write_custom_conf_files(ctx: CephadmContext, daemon_type: str, daemon_id: str, fsid: str, uid: int, gid: int) -> None:
+    # mostly making this its own function to make unit testing easier
+    if 'config_json' not in ctx or not ctx.config_json:
+        return
+    config_json = get_custom_config_files(ctx.config_json)
+    custom_config_dir = os.path.join(ctx.data_dir, fsid, 'custom_config_files', f'{daemon_type}.{daemon_id}')
+    if not os.path.exists(custom_config_dir):
+        makedirs(custom_config_dir, uid, gid, 0o755)
+    mandatory_keys = ['mount_path', 'content']
+    for ccf in config_json['custom_config_files']:
+        if all(k in ccf for k in mandatory_keys):
+            file_path = os.path.join(custom_config_dir, os.path.basename(ccf['mount_path']))
+            with open(file_path, 'w+', encoding='utf-8') as f:
+                os.fchown(f.fileno(), uid, gid)
+                os.fchmod(f.fileno(), 0o600)
+                f.write(ccf['content'])
+
+
+def get_parm(option: str) -> Dict[str, str]:
+    js = _get_config_json(option)
+    # custom_config_files is a special field that may be in the config
+    # dict. It is used for mounting custom config files into daemon's containers
+    # and should be accessed through the "get_custom_config_files" function.
+    # For get_parm we need to discard it.
+    js.pop('custom_config_files', None)
+    return js
+
+
+def get_custom_config_files(option: str) -> Dict[str, List[Dict[str, str]]]:
+    js = _get_config_json(option)
+    res: Dict[str, List[Dict[str, str]]] = {'custom_config_files': []}
+    if 'custom_config_files' in js:
+        res['custom_config_files'] = js['custom_config_files']
+    return res
+
+
+def _get_config_json(option: str) -> Dict[str, Any]:
     if not option:
         return dict()
 
@@ -2685,6 +2749,18 @@ def get_container_mounts(ctx, fsid, daemon_type, daemon_id,
         data_dir = get_data_dir(fsid, ctx.data_dir, daemon_type, daemon_id)
         mounts.update(cc.get_container_mounts(data_dir))
 
+    # Modifications podman makes to /etc/hosts causes issues with
+    # certain daemons (specifically referencing "host.containers.internal" entry
+    # being added to /etc/hosts in this case). To avoid that, but still
+    # allow users to use /etc/hosts for hostname resolution, we can
+    # mount the host's /etc/hosts file.
+    # https://tracker.ceph.com/issues/58532
+    # https://tracker.ceph.com/issues/57018
+    if isinstance(ctx.container_engine, Podman):
+        if os.path.exists('/etc/hosts'):
+            if '/etc/hosts' not in mounts:
+                mounts['/etc/hosts'] = '/etc/hosts:ro'
+
     return mounts
 
 
@@ -2715,6 +2791,20 @@ def get_ceph_volume_container(ctx: CephadmContext,
     )
 
 
+def set_pids_limit_unlimited(ctx: CephadmContext, container_args: List[str]) -> None:
+    # set container's pids-limit to unlimited rather than default (Docker 4096 / Podman 2048)
+    # Useful for daemons like iscsi where the default pids-limit limits the number of luns
+    # per iscsi target or rgw where increasing the rgw_thread_pool_size to a value near
+    # the default pids-limit may cause the container to crash.
+    if (
+        isinstance(ctx.container_engine, Podman)
+        and ctx.container_engine.version >= PIDS_LIMIT_UNLIMITED_PODMAN_VERSION
+    ):
+        container_args.append('--pids-limit=-1')
+    else:
+        container_args.append('--pids-limit=0')
+
+
 def get_container(ctx: CephadmContext,
                   fsid: str, daemon_type: str, daemon_id: Union[int, str],
                   privileged: bool = False,
@@ -2730,6 +2820,8 @@ def get_container(ctx: CephadmContext,
         envs.append('TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=134217728')
     if container_args is None:
         container_args = []
+    if daemon_type in Ceph.daemons or daemon_type in Ceph.gateways:
+        set_pids_limit_unlimited(ctx, container_args)
     if daemon_type in ['mon', 'osd']:
         # mon and osd need privileged in order for libudev to query devices
         privileged = True
@@ -2811,6 +2903,14 @@ def get_container(ctx: CephadmContext,
         ])
         if ctx.container_engine.version >= CGROUPS_SPLIT_PODMAN_VERSION:
             container_args.append('--cgroups=split')
+        # if /etc/hosts doesn't exist, we can be confident
+        # users aren't using it for host name resolution
+        # and adding --no-hosts avoids bugs created in certain daemons
+        # by modifications podman makes to /etc/hosts
+        # https://tracker.ceph.com/issues/58532
+        # https://tracker.ceph.com/issues/57018
+        if not os.path.exists('/etc/hosts'):
+            container_args.extend(['--no-hosts'])
 
     return CephContainer.for_daemon(
         ctx,
@@ -2962,7 +3062,7 @@ def deploy_daemon(ctx, fsid, daemon_type, daemon_id, c, uid, gid,
     # Open ports explicitly required for the daemon
     if ports:
         fw = Firewalld(ctx)
-        fw.open_ports(ports)
+        fw.open_ports(ports + fw.external_ports.get(daemon_type, []))
         fw.apply_rules()
 
     if reconfig and daemon_type not in Ceph.daemons:
@@ -3039,6 +3139,15 @@ def deploy_daemon_units(
     ports: Optional[List[int]] = None,
 ) -> None:
     # cmd
+
+    def add_stop_actions(f: TextIO) -> None:
+        # following generated script basically checks if the container exists
+        # before stopping it. Exit code will be success either if it doesn't
+        # exist or if it exists and is stopped successfully.
+        container_exists = f'{ctx.container_engine.path} inspect %s &>/dev/null'
+        f.write(f'! {container_exists % c.old_cname} || {" ".join(c.stop_cmd(old_cname=True))} \n')
+        f.write(f'! {container_exists % c.cname} || {" ".join(c.stop_cmd())} \n')
+
     data_dir = get_data_dir(fsid, ctx.data_dir, daemon_type, daemon_id)
     with open(data_dir + '/unit.run.new', 'w') as f, \
             open(data_dir + '/unit.meta.new', 'w') as metaf:
@@ -3125,6 +3234,9 @@ def deploy_daemon_units(
 
     # post-stop command(s)
     with open(data_dir + '/unit.poststop.new', 'w') as f:
+        # this is a fallback to eventually stop any underlying container that was not stopped properly by unit.stop,
+        # this could happen in very slow setups as described in the issue https://tracker.ceph.com/issues/58242.
+        add_stop_actions(f)
         if daemon_type == 'osd':
             assert osd_fsid
             poststop = get_ceph_volume_container(
@@ -3151,9 +3263,7 @@ def deploy_daemon_units(
 
     # post-stop command(s)
     with open(data_dir + '/unit.stop.new', 'w') as f:
-        f.write('! ' + ' '.join(c.stop_cmd()) + '\n')
-        f.write('! ' + ' '.join(c.stop_cmd(old_cname=True)) + '\n')
-
+        add_stop_actions(f)
         os.fchmod(f.fileno(), 0o600)
         os.rename(data_dir + '/unit.stop.new',
                   data_dir + '/unit.stop')
@@ -3191,6 +3301,18 @@ def deploy_daemon_units(
 
 
 class Firewalld(object):
+
+    # for specifying ports we should always open when opening
+    # ports for a daemon of that type. Main use case is for ports
+    # that we should open when deploying the daemon type but that
+    # the daemon itself may not necessarily need to bind to the port.
+    # This needs to be handed differently as we don't want to fail
+    # deployment if the port cannot be bound to but we still want to
+    # open the port in the firewall.
+    external_ports: Dict[str, List[int]] = {
+        'iscsi': [3260]  # 3260 is the well known iSCSI port
+    }
+
     def __init__(self, ctx):
         # type: (CephadmContext) -> None
         self.ctx = ctx
@@ -3420,6 +3542,10 @@ def install_base_units(ctx, fsid):
         call_throws(ctx, ['systemctl', 'enable', 'ceph-%s.target' % fsid])
         call_throws(ctx, ['systemctl', 'start', 'ceph-%s.target' % fsid])
 
+    # don't overwrite file in order to allow users to manipulate it
+    if os.path.exists(ctx.logrotate_dir + f'/ceph-{fsid}'):
+        return
+
     # logrotate for the cluster
     with open(ctx.logrotate_dir + '/ceph-%s' % fsid, 'w') as f:
         """
@@ -3483,7 +3609,7 @@ ExecStopPost=-/bin/bash {data_dir}/{fsid}/%i/unit.poststop
 KillMode=none
 Restart=on-failure
 RestartSec=10s
-TimeoutStartSec=120
+TimeoutStartSec=200
 TimeoutStopSec=120
 StartLimitInterval=30min
 StartLimitBurst=5
@@ -4005,7 +4131,7 @@ def get_public_net_from_cfg(ctx: CephadmContext) -> Optional[str]:
         return None
 
     # Ensure all public CIDR networks are valid
-    public_network = cp.get('global', 'public_network')
+    public_network = cp.get('global', 'public_network').strip('"').strip("'")
     rc, _, err_msg = check_subnet(public_network)
     if rc:
         raise Error(f'Invalid public_network {public_network} parameter: {err_msg}')
@@ -4102,7 +4228,7 @@ def prepare_cluster_network(ctx: CephadmContext) -> Tuple[str, bool]:
     cp = read_config(ctx.config)
     cluster_network = ctx.cluster_network
     if cluster_network is None and cp.has_option('global', 'cluster_network'):
-        cluster_network = cp.get('global', 'cluster_network')
+        cluster_network = cp.get('global', 'cluster_network').strip('"').strip("'")
 
     if cluster_network:
         cluser_nets = set([x.strip() for x in cluster_network.split(',')])
@@ -4651,6 +4777,8 @@ def _distribute_ssh_keys(ctx: CephadmContext, host_spec: Dict[str, str], bootstr
 def command_bootstrap(ctx):
     # type: (CephadmContext) -> int
 
+    ctx.error_code = 0
+
     if not ctx.output_config:
         ctx.output_config = os.path.join(ctx.output_dir, 'ceph.conf')
     if not ctx.output_keyring:
@@ -4880,6 +5008,7 @@ def command_bootstrap(ctx):
             out = cli(['orch', 'apply', '-i', '/tmp/spec.yml'], extra_mounts=mounts)
             logger.info(out)
         except Exception:
+            ctx.error_code = -errno.EINVAL
             logger.info('\nApplying %s to cluster failed!\n' % ctx.apply_spec)
 
     # enable autotune for osd_memory_target
@@ -4903,7 +5032,7 @@ def command_bootstrap(ctx):
                 'For more information see:\n\n'
                 '\thttps://docs.ceph.com/en/pacific/mgr/telemetry/\n')
     logger.info('Bootstrap complete.')
-    return 0
+    return ctx.error_code
 
 ##################################
 
@@ -4968,16 +5097,32 @@ def extract_uid_gid_monitoring(ctx, daemon_type):
     return uid, gid
 
 
-def get_container_with_extra_args(ctx: CephadmContext,
-                                  fsid: str, daemon_type: str, daemon_id: Union[int, str],
-                                  privileged: bool = False,
-                                  ptrace: bool = False,
-                                  container_args: Optional[List[str]] = None) -> 'CephContainer':
-    # wrapper for get_container that additionally adds extra_container_args if present
-    # used for deploying daemons with additional podman/docker container arguments
+def get_deployment_container(ctx: CephadmContext,
+                             fsid: str, daemon_type: str, daemon_id: Union[int, str],
+                             privileged: bool = False,
+                             ptrace: bool = False,
+                             container_args: Optional[List[str]] = None) -> 'CephContainer':
+    # wrapper for get_container specifically for containers made during the `cephadm deploy`
+    # command. Adds some extra things such as extra container args and custom config files
     c = get_container(ctx, fsid, daemon_type, daemon_id, privileged, ptrace, container_args)
     if 'extra_container_args' in ctx and ctx.extra_container_args:
         c.container_args.extend(ctx.extra_container_args)
+    if 'extra_entrypoint_args' in ctx and ctx.extra_entrypoint_args:
+        c.args.extend(ctx.extra_entrypoint_args)
+    if 'config_json' in ctx and ctx.config_json:
+        conf_files = get_custom_config_files(ctx.config_json)
+        mandatory_keys = ['mount_path', 'content']
+        for conf in conf_files['custom_config_files']:
+            if all(k in conf for k in mandatory_keys):
+                mount_path = conf['mount_path']
+                file_path = os.path.join(
+                    ctx.data_dir,
+                    fsid,
+                    'custom_config_files',
+                    f'{daemon_type}.{daemon_id}',
+                    os.path.basename(mount_path)
+                )
+                c.volume_mounts[file_path] = mount_path
     return c
 
 
@@ -5022,8 +5167,8 @@ def command_deploy(ctx):
         uid, gid = extract_uid_gid(ctx)
         make_var_run(ctx, ctx.fsid, uid, gid)
 
-        c = get_container_with_extra_args(ctx, ctx.fsid, daemon_type, daemon_id,
-                                          ptrace=ctx.allow_ptrace)
+        c = get_deployment_container(ctx, ctx.fsid, daemon_type, daemon_id,
+                                     ptrace=ctx.allow_ptrace)
         deploy_daemon(ctx, ctx.fsid, daemon_type, daemon_id, c, uid, gid,
                       config=config, keyring=keyring,
                       osd_fsid=ctx.osd_fsid,
@@ -5047,7 +5192,7 @@ def command_deploy(ctx):
                             'contain arg for {}'.format(daemon_type.capitalize(), ', '.join(required_args)))
 
         uid, gid = extract_uid_gid_monitoring(ctx, daemon_type)
-        c = get_container_with_extra_args(ctx, ctx.fsid, daemon_type, daemon_id)
+        c = get_deployment_container(ctx, ctx.fsid, daemon_type, daemon_id)
         deploy_daemon(ctx, ctx.fsid, daemon_type, daemon_id, c, uid, gid,
                       reconfig=ctx.reconfig,
                       ports=daemon_ports)
@@ -5059,7 +5204,7 @@ def command_deploy(ctx):
         config, keyring = get_config_and_keyring(ctx)
         # TODO: extract ganesha uid/gid (997, 994) ?
         uid, gid = extract_uid_gid(ctx)
-        c = get_container_with_extra_args(ctx, ctx.fsid, daemon_type, daemon_id)
+        c = get_deployment_container(ctx, ctx.fsid, daemon_type, daemon_id)
         deploy_daemon(ctx, ctx.fsid, daemon_type, daemon_id, c, uid, gid,
                       config=config, keyring=keyring,
                       reconfig=ctx.reconfig,
@@ -5068,7 +5213,7 @@ def command_deploy(ctx):
     elif daemon_type == CephIscsi.daemon_type:
         config, keyring = get_config_and_keyring(ctx)
         uid, gid = extract_uid_gid(ctx)
-        c = get_container_with_extra_args(ctx, ctx.fsid, daemon_type, daemon_id)
+        c = get_deployment_container(ctx, ctx.fsid, daemon_type, daemon_id)
         deploy_daemon(ctx, ctx.fsid, daemon_type, daemon_id, c, uid, gid,
                       config=config, keyring=keyring,
                       reconfig=ctx.reconfig,
@@ -5077,7 +5222,7 @@ def command_deploy(ctx):
     elif daemon_type == HAproxy.daemon_type:
         haproxy = HAproxy.init(ctx, ctx.fsid, daemon_id)
         uid, gid = haproxy.extract_uid_gid_haproxy()
-        c = get_container_with_extra_args(ctx, ctx.fsid, daemon_type, daemon_id)
+        c = get_deployment_container(ctx, ctx.fsid, daemon_type, daemon_id)
         deploy_daemon(ctx, ctx.fsid, daemon_type, daemon_id, c, uid, gid,
                       reconfig=ctx.reconfig,
                       ports=daemon_ports)
@@ -5085,7 +5230,7 @@ def command_deploy(ctx):
     elif daemon_type == Keepalived.daemon_type:
         keepalived = Keepalived.init(ctx, ctx.fsid, daemon_id)
         uid, gid = keepalived.extract_uid_gid_keepalived()
-        c = get_container_with_extra_args(ctx, ctx.fsid, daemon_type, daemon_id)
+        c = get_deployment_container(ctx, ctx.fsid, daemon_type, daemon_id)
         deploy_daemon(ctx, ctx.fsid, daemon_type, daemon_id, c, uid, gid,
                       reconfig=ctx.reconfig,
                       ports=daemon_ports)
@@ -5094,9 +5239,9 @@ def command_deploy(ctx):
         cc = CustomContainer.init(ctx, ctx.fsid, daemon_id)
         if not ctx.reconfig and not redeploy:
             daemon_ports.extend(cc.ports)
-        c = get_container_with_extra_args(ctx, ctx.fsid, daemon_type, daemon_id,
-                                          privileged=cc.privileged,
-                                          ptrace=ctx.allow_ptrace)
+        c = get_deployment_container(ctx, ctx.fsid, daemon_type, daemon_id,
+                                     privileged=cc.privileged,
+                                     ptrace=ctx.allow_ptrace)
         deploy_daemon(ctx, ctx.fsid, daemon_type, daemon_id, c,
                       uid=cc.uid, gid=cc.gid, config=None,
                       keyring=None, reconfig=ctx.reconfig,
@@ -5118,7 +5263,7 @@ def command_deploy(ctx):
 
     elif daemon_type == SNMPGateway.daemon_type:
         sc = SNMPGateway.init(ctx, ctx.fsid, daemon_id)
-        c = get_container_with_extra_args(ctx, ctx.fsid, daemon_type, daemon_id)
+        c = get_deployment_container(ctx, ctx.fsid, daemon_type, daemon_id)
         deploy_daemon(ctx, ctx.fsid, daemon_type, daemon_id, c,
                       sc.uid, sc.gid,
                       ports=daemon_ports)
@@ -6268,7 +6413,7 @@ def _zap_osds(ctx: CephadmContext) -> None:
         raise Error(f'Invalid JSON in ceph-volume inventory: {e}')
 
     for i in ls:
-        matches = [lv.get('cluster_fsid') == ctx.fsid for lv in i.get('lvs', [])]
+        matches = [lv.get('cluster_fsid') == ctx.fsid and i.get('ceph_device') for lv in i.get('lvs', [])]
         if any(matches) and all(matches):
             _zap(ctx, i.get('path'))
         elif any(matches):
@@ -6749,6 +6894,7 @@ class YumDnf(Packager):
         'scientific': ('centos', 'el'),
         'rocky': ('centos', 'el'),
         'almalinux': ('centos', 'el'),
+        'ol': ('centos', 'el'),
         'fedora': ('fedora', 'fc'),
         'mariner': ('mariner', 'cm'),
     }
@@ -7282,6 +7428,14 @@ class HostFacts():
         return platform.node()
 
     @property
+    def shortname(self) -> str:
+        return platform.node().split('.', 1)[0]
+
+    @property
+    def fqdn(self) -> str:
+        return get_fqdn()
+
+    @property
     def subscribed(self):
         # type: () -> str
         """Highlevel check to see if the host is subscribed to receive updates/support"""
@@ -7310,12 +7464,15 @@ class HostFacts():
 
     def _get_capacity(self, dev):
         # type: (str) -> int
-        """Determine the size of a given device"""
+        """Determine the size of a given device
+
+        The kernel always bases device size calculations based on a 512 byte
+        sector. For more information see
+        https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/types.h?h=v5.15.63#n120
+        """
         size_path = os.path.join('/sys/block', dev, 'size')
         size_blocks = int(read_file([size_path]))
-        blk_path = os.path.join('/sys/block', dev, 'queue', 'logical_block_size')
-        blk_count = int(read_file([blk_path]))
-        return size_blocks * blk_count
+        return size_blocks * 512
 
     def _get_capacity_by_type(self, rota='0'):
         # type: (str) -> int
@@ -9018,6 +9175,12 @@ def _get_parser():
         action='append',
         default=[],
         help='Additional container arguments to apply to deamon'
+    )
+    parser_deploy.add_argument(
+        '--extra-entrypoint-args',
+        action='append',
+        default=[],
+        help='Additional entrypoint arguments to apply to deamon'
     )
 
     parser_check_host = subparsers.add_parser(

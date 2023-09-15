@@ -100,10 +100,24 @@ struct ceph_statx {
 #endif
 
 /*
+ * This is deprecated and just for backwards compatibility.
+ * Please use AT_STATX_DONT_SYNC instead.
+ */
+#define AT_NO_ATTR_SYNC		AT_STATX_DONT_SYNC /* Deprecated */
+
+/*
  * The statx interfaces only allow these flags. In order to allow us to add
  * others in the future, we disallow setting any that aren't recognized.
  */
 #define CEPH_REQ_FLAG_MASK		(AT_SYMLINK_NOFOLLOW|AT_STATX_DONT_SYNC)
+
+/* fallocate mode flags */
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE 0x01
+#endif
+#ifndef FALLOC_FL_PUNCH_HOLE
+#define FALLOC_FL_PUNCH_HOLE 0x02
+#endif
 
 /* delegation recalls */
 typedef void (*ceph_deleg_cb_t)(Fh *fh, void *priv);

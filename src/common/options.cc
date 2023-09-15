@@ -3972,6 +3972,22 @@ std::vector<Option> get_global_options() {
     .set_default(4_K)
     .set_description("The block size for index partitions. (0 = rocksdb default)"),
 
+    Option("rocksdb_cf_compact_on_deletion", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(false)
+    .set_description("Compact the column family when a certain number of tombstones are observed within a given window.")
+    .set_long_description("This setting instructs RocksDB to compact a column family when a certain number of tombstones are observed during iteration within a certain sliding window. For instance if rocksdb_cf_compact_on_deletion_sliding_window is 8192 and rocksdb_cf_compact_on_deletion_trigger is 4096,  then once 4096 tombstones are observed after iteration over 8192 entries, the column family will be compacted.")
+    .add_see_also({"rocksdb_cf_compact_on_deletion_sliding_window", "rocksdb_cf_compact_on_deletion_trigger"}),
+
+    Option("rocksdb_cf_compact_on_deletion_sliding_window", Option::TYPE_INT, Option::LEVEL_DEV)
+    .set_default(32768)
+    .set_description("The sliding window to use when rocksdb_cf_compact_on_deletion is enabled.")
+    .add_see_also({"rocksdb_cf_compact_on_deletion"}),
+
+    Option("rocksdb_cf_compact_on_deletion_trigger", Option::TYPE_INT, Option::LEVEL_DEV)
+    .set_default(16384)
+    .set_description("The trigger to use when rocksdb_cf_compact_on_deletion is enabled.")
+    .add_see_also({"rocksdb_cf_compact_on_deletion"}),
+
     Option("mon_rocksdb_options", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("write_buffer_size=33554432,"
 		 "compression=kNoCompression,"
@@ -4261,6 +4277,18 @@ std::vector<Option> get_global_options() {
     Option("bluefs_shared_alloc_size", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
     .set_default(64_K)
     .set_description("Allocation unit size for primary/shared device"),
+
+    Option("bluefs_failed_shared_alloc_cooldown", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(600)
+    .set_description(
+        "Duration(in seconds) until the next attempt to use "
+        "'bluefs_shared_alloc_size' after facing ENOSPC failure.")
+    .set_long_description(
+        "Cooldown period(in seconds) when BlueFS uses shared/slow device "
+        "allocation size instead of 'bluefs_shared_alloc_size' one after facing "
+        "recoverable (via fallback to smaller chunk size) ENOSPC failure. Intended "
+        "primarily to avoid repetitive unsuccessful allocations which might be "
+        " expensive."),
 
     Option("bluefs_max_prefetch", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
     .set_default(1_M)
@@ -5634,6 +5662,11 @@ std::vector<Option> get_global_options() {
     .set_description("Period in seconds between monitor-to-manager "
                      "health/status updates"),
 
+    Option("mon_down_mkfs_grace", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+    .set_default(60)
+    .add_service("mon")
+    .set_description("Period in seconds that the cluster may have a mon down after cluster creation"),
+
     Option("mon_mgr_beacon_grace", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
     .set_default(30)
     .add_service("mon")
@@ -5862,6 +5895,10 @@ std::vector<Option> get_rgw_options() {
     Option("rgw_bucket_index_max_aio", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(128)
     .set_description("Max number of concurrent RADOS requests when handling bucket shards."),
+
+    Option("rgw_multi_obj_del_max_aio", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(16)
+    .set_description("Max number of concurrent RADOS requests per multi-object delete request."),
 
     Option("rgw_enable_quota_threads", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
@@ -7129,6 +7166,20 @@ std::vector<Option> get_rgw_options() {
     .set_min(30)
     .set_description("Number of seconds the timeout on the reshard locks (bucket reshard lock and reshard log lock) are set to. As a reshard proceeds these locks can be renewed/extended. If too short, reshards cannot complete and will fail, causing a future reshard attempt. If too long a hung or crashed reshard attempt will keep the bucket locked for an extended period, not allowing RGW to detect the failed reshard attempt and recover.")
     .add_tag("performance")
+    .add_service("rgw"),
+
+    Option("rgw_debug_inject_set_olh_err", Option::TYPE_UINT, Option::LEVEL_DEV)
+    .set_default(0)
+    .set_description("Whether to inject errors between rados olh modification initialization and "
+        "bucket index instance linking. The value determines the error code. This exists "
+        "for development and testing purposes to help simulate cases where bucket index "
+        "entries aren't cleaned up by the request thread after an error scenario.")
+    .add_service("rgw"),
+
+    Option("rgw_debug_inject_olh_cancel_modification_err", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(false)
+    .set_description("Whether to inject an error to simulate a failure to cancel olh "
+        "modification. This exists for development and testing purposes.")
     .add_service("rgw"),
 
     Option("rgw_reshard_batch_size", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
@@ -8405,13 +8456,13 @@ std::vector<Option> get_mds_options() {
     .set_long_description("This is the order of magnitude difference (in base 2) of the internal liveness decay counter and the number of capabilities the session holds. When this difference occurs, the MDS treats the session as quiescent and begins recalling capabilities."),
 
     Option("mds_session_cap_acquisition_decay_rate", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(10)
+    .set_default(30)
     .set_description("decay rate for session readdir caps leading to readdir throttle")
     .set_flag(Option::FLAG_RUNTIME)
     .set_long_description("The half-life for the session cap acquisition counter of caps acquired by readdir. This is used for throttling readdir requests from clients slow to release caps."),
 
     Option("mds_session_cap_acquisition_throttle", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
-    .set_default(500000)
+    .set_default(100000)
     .set_description("throttle point for cap acquisition decay counter"),
 
     Option("mds_session_max_caps_throttle_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
@@ -8679,6 +8730,25 @@ std::vector<Option> get_mds_options() {
     .set_default(false)
     .set_description(""),
 
+    Option("mds_abort_on_newly_corrupt_dentry", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("MDS will abort if dentry is detected newly corrupted."),
+
+    Option("mds_go_bad_corrupt_dentry", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("MDS will mark a corrupt dentry as bad and isolate"),
+
+    Option("mds_inject_rename_corrupt_dentry_first", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(0.0)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("probabilistically inject corrupt CDentry::first at rename"),
+
+    Option("mds_inject_journal_corrupt_dentry_first", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(0.0)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("probabilistically inject corrupt CDentry::first at journal load"),
+
     Option("mds_kill_mdstable_at", Option::TYPE_INT, Option::LEVEL_DEV)
     .set_default(0)
     .set_description(""),
@@ -8726,6 +8796,18 @@ std::vector<Option> get_mds_options() {
     Option("mds_kill_create_at", Option::TYPE_INT, Option::LEVEL_DEV)
     .set_default(0)
     .set_description(""),
+
+    Option("mds_inject_health_dummy", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(false)
+    .set_description(""),
+
+    Option("mds_kill_skip_replaying_inotable", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(false)
+    .set_description("Ceph will skip replaying the inotable when replaying the journal, and the premary MDS will crash, while the replacing MDS won't. (for testing only)"),
+
+    Option("mds_inject_skip_replaying_inotable", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(false)
+    .set_description("Ceph will skip replaying the inotable when replaying the journal, and the premary MDS will crash, while the replacing MDS won't. (for testing only)"),
 
     Option("mds_inject_traceless_reply_probability", Option::TYPE_FLOAT, Option::LEVEL_DEV)
     .set_default(0)
@@ -8867,10 +8949,6 @@ std::vector<Option> get_mds_options() {
      .set_default(0)
      .set_description("number of seconds after which clients which have not responded to cap revoke messages by the MDS are evicted."),
 
-    Option("mds_max_retries_on_remount_failure", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
-     .set_default(5)
-     .set_description("number of consecutive failed remount attempts for invalidating kernel dcache after which client would abort."),
-
     Option("mds_dump_cache_threshold_formatter", Option::TYPE_SIZE, Option::LEVEL_DEV)
      .set_default(1_G)
      .set_description("threshold for cache usage to disallow \"dump cache\" operation to formatter")
@@ -8931,7 +9009,14 @@ std::vector<Option> get_mds_options() {
      .set_default(0)
      .set_flag(Option::FLAG_RUNTIME)
      .set_description("maximum number of entries per directory before new creat/links fail")
-     .set_long_description("The maximum number of entries before any new entries are rejected with ENOSPC.")
+     .set_long_description("The maximum number of entries before any new entries are rejected with ENOSPC."),
+
+    Option("defer_client_eviction_on_laggy_osds", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+     .set_default(true)
+     .set_flag(Option::FLAG_RUNTIME)
+     .set_description("Do not evict client if any osd is laggy")
+     .set_long_description("Laggy OSD(s) can make clients laggy or unresponsive, this can lead to their eviction, this option once enabled can help defer client eviction.")
+
   });
 }
 
@@ -9085,6 +9170,10 @@ std::vector<Option> get_mds_client_options() {
     .set_default(false)
     .set_description(""),
 
+    Option("client_max_retries_on_remount_failure", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+     .set_default(5)
+     .set_description("number of consecutive failed remount attempts for invalidating kernel dcache after which client would abort."),
+
     // note: the max amount of "in flight" dirty data is roughly (max - target)
     Option("fuse_use_invalidate_cb", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
@@ -9168,6 +9257,8 @@ std::vector<Option> get_mds_client_options() {
     .set_description("confirm access to inode's data pool/namespace described in file layout"),
 
     Option("client_use_faked_inos", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_flag(Option::FLAG_STARTUP)
+    .set_flag(Option::FLAG_NO_MON_UPDATE)
     .set_default(false)
     .set_description(""),
 

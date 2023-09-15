@@ -26,7 +26,8 @@ from ceph.deployment import inventory
 from ceph.deployment.drive_group import DriveGroupSpec
 from ceph.deployment.service_spec import \
     ServiceSpec, PlacementSpec, \
-    HostPlacementSpec, IngressSpec
+    HostPlacementSpec, IngressSpec, \
+    IscsiServiceSpec, PrometheusSpec
 from ceph.utils import str_to_datetime, datetime_to_str, datetime_now
 from cephadm.serve import CephadmServe
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
@@ -494,6 +495,9 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
 
         self.mgr_service: MgrService = cast(MgrService, self.cephadm_services['mgr'])
         self.osd_service: OSDService = cast(OSDService, self.cephadm_services['osd'])
+        self.iscsi_service: IscsiService = cast(IscsiService, self.cephadm_services['iscsi'])
+
+        self.scheduled_async_actions: List[Callable] = []
 
         self.template = TemplateMgr(self)
 
@@ -1605,8 +1609,8 @@ Then run the following:
                 self.log.info(f"removing: {d.name()}")
 
                 if d.daemon_type != 'osd':
-                    self.cephadm_services[str(d.daemon_type)].pre_remove(d)
-                    self.cephadm_services[str(d.daemon_type)].post_remove(d, is_failed_deploy=False)
+                    self.cephadm_services[daemon_type_to_service(str(d.daemon_type))].pre_remove(d)
+                    self.cephadm_services[daemon_type_to_service(str(d.daemon_type))].post_remove(d, is_failed_deploy=False)
                 else:
                     cmd_args = {
                         'prefix': 'osd purge-actual',
@@ -1898,8 +1902,39 @@ Then run the following:
         })
         extra = self.extra_ceph_conf().conf
         if extra:
-            config += '\n\n' + extra.strip() + '\n'
+            try:
+                config = self._combine_confs(config, extra)
+            except Exception as e:
+                self.log.error(f'Failed to add extra ceph conf settings to minimal ceph conf: {e}')
         return config
+
+    def _combine_confs(self, conf1: str, conf2: str) -> str:
+        section_to_option: Dict[str, List[str]] = {}
+        final_conf: str = ''
+        for conf in [conf1, conf2]:
+            if not conf:
+                continue
+            section = ''
+            for line in conf.split('\n'):
+                if line.strip().startswith('#') or not line.strip():
+                    continue
+                if line.strip().startswith('[') and line.strip().endswith(']'):
+                    section = line.strip().replace('[', '').replace(']', '')
+                    if section not in section_to_option:
+                        section_to_option[section] = []
+                else:
+                    section_to_option[section].append(line.strip())
+
+        first_section = True
+        for section, options in section_to_option.items():
+            if not first_section:
+                final_conf += '\n'
+            final_conf += f'[{section}]\n'
+            for option in options:
+                final_conf += f'{option}\n'
+            first_section = False
+
+        return final_conf
 
     def _invalidate_daemons_and_kick_serve(self, filter_host: Optional[str] = None) -> None:
         if filter_host:
@@ -2057,6 +2092,10 @@ Then run the following:
             if daemon_spec.daemon_type != 'osd':
                 daemon_spec = self.cephadm_services[daemon_type_to_service(
                     daemon_spec.daemon_type)].prepare_create(daemon_spec)
+            else:
+                # for OSDs, we still need to update config, just not carry out the full
+                # prepare_create function
+                daemon_spec.final_config, daemon_spec.deps = self.osd_service.generate_config(daemon_spec)
             return CephadmServe(self)._create_daemon(daemon_spec, reconfig=(action == 'reconfig'))
 
         actions = {
@@ -2452,7 +2491,11 @@ Then run the following:
             daemons = self.cache.get_daemons_by_service(spec.service_name())
             deps = [d.name() for d in daemons if d.daemon_type == 'haproxy']
         elif daemon_type == 'iscsi':
-            deps = [self.get_mgr_ip()]
+            if spec:
+                iscsi_spec = cast(IscsiServiceSpec, spec)
+                deps = [self.iscsi_service.get_trusted_ips(iscsi_spec)]
+            else:
+                deps = [self.get_mgr_ip()]
         else:
             need = {
                 'prometheus': ['mgr', 'alertmanager', 'node-exporter', 'ingress'],
@@ -2566,6 +2609,19 @@ Then run the following:
             # _trigger preview refresh needs to be smart and
             # should only refresh if a change has been detected
             self._trigger_preview_refresh(specs=[cast(DriveGroupSpec, spec)])
+
+        if spec.service_type == 'prometheus':
+            spec = cast(PrometheusSpec, spec)
+            if spec.retention_time:
+                valid_units = ['y', 'w', 'd', 'h', 'm', 's']
+                m = re.search(rf"^(\d+)({'|'.join(valid_units)})$", spec.retention_time)
+                if not m:
+                    raise OrchestratorError(f"Invalid retention time. Valid units are: {', '.join(valid_units)}")
+            if spec.retention_size:
+                valid_units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB']
+                m = re.search(rf"^(\d+)({'|'.join(valid_units)})$", spec.retention_size)
+                if not m:
+                    raise OrchestratorError(f"Invalid retention size. Valid units are: {', '.join(valid_units)}")
 
         return self._apply_service_spec(cast(ServiceSpec, spec))
 
@@ -2868,7 +2924,8 @@ Then run the following:
     def remove_osds(self, osd_ids: List[str],
                     replace: bool = False,
                     force: bool = False,
-                    zap: bool = False) -> str:
+                    zap: bool = False,
+                    no_destroy: bool = False) -> str:
         """
         Takes a list of OSDs and schedules them for removal.
         The function that takes care of the actual removal is
@@ -2890,6 +2947,7 @@ Then run the following:
                                                 replace=replace,
                                                 force=force,
                                                 zap=zap,
+                                                no_destroy=no_destroy,
                                                 hostname=daemon.hostname,
                                                 process_started_at=datetime_now(),
                                                 remove_util=self.to_remove_osds.rm_util))

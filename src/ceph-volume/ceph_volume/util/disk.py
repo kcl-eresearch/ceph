@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import stat
+import time
 from ceph_volume import process
 from ceph_volume.api import lvm
 from ceph_volume.util.system import get_file_contents
@@ -134,8 +135,16 @@ def remove_partition(device):
 
     :param device: A ``Device()`` object
     """
-    udev_info = udevadm_property(device.path)
-    partition_number = udev_info.get('ID_PART_ENTRY_NUMBER')
+    # Sometimes there's a race condition that makes 'ID_PART_ENTRY_NUMBER' be not present
+    # in the output of `udevadm info --query=property`.
+    # Probably not ideal and not the best fix but this allows to get around that issue.
+    # The idea is to make it retry multiple times before actually failing.
+    for i in range(10):
+        udev_info = udevadm_property(device.path)
+        partition_number = udev_info.get('ID_PART_ENTRY_NUMBER')
+        if partition_number:
+            break
+        time.sleep(0.2)
     if not partition_number:
         raise RuntimeError('Unable to detect the partition number for device: %s' % device.path)
 
@@ -229,9 +238,16 @@ def _udevadm_info(device):
 
 
 def lsblk(device, columns=None, abspath=False):
-    return lsblk_all(device=device,
-                     columns=columns,
-                     abspath=abspath)
+    result = []
+    if not os.path.isdir(device):
+        result = lsblk_all(device=device,
+                           columns=columns,
+                           abspath=abspath)
+    if not result:
+        logger.debug(f"{device} not found is lsblk report")
+        return {}
+
+    return result[0]
 
 def lsblk_all(device='', columns=None, abspath=False):
     """
@@ -311,6 +327,9 @@ def lsblk_all(device='', columns=None, abspath=False):
         base_command.append('-p')
     base_command.append('-o')
     base_command.append(','.join(columns))
+    if device:
+        base_command.append('--nodeps')
+        base_command.append(device)
 
     out, err, rc = process.call(base_command)
 
@@ -322,14 +341,8 @@ def lsblk_all(device='', columns=None, abspath=False):
     for line in out:
         result.append(_lsblk_parser(line))
 
-    if not device:
-        return result
+    return result
 
-    for dev in result:
-        if dev['NAME'] == os.path.basename(device):
-            return dev
-
-    return {}
 
 def is_device(dev):
     """
@@ -768,7 +781,7 @@ class AllowLoopDevices(object):
 allow_loop_devices = AllowLoopDevices()
 
 
-def get_block_devs_sysfs(_sys_block_path='/sys/block', _sys_dev_block_path='/sys/dev/block'):
+def get_block_devs_sysfs(_sys_block_path='/sys/block', _sys_dev_block_path='/sys/dev/block', device=''):
     def holder_inner_loop():
         for holder in holders:
             # /sys/block/sdy/holders/dm-8/dm/uuid
@@ -778,7 +791,10 @@ def get_block_devs_sysfs(_sys_block_path='/sys/block', _sys_dev_block_path='/sys
 
     # First, get devices that are _not_ partitions
     result = list()
-    dev_names = os.listdir(_sys_block_path)
+    if not device:
+        dev_names = os.listdir(_sys_block_path)
+    else:
+        dev_names = [device]
     for dev in dev_names:
         name = kname = os.path.join("/dev", dev)
         if not os.path.exists(name):

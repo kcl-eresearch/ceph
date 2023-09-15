@@ -130,6 +130,8 @@ OPTION(ms_connection_idle_timeout, OPT_U64)
 OPTION(ms_pq_max_tokens_per_priority, OPT_U64)
 OPTION(ms_pq_min_cost, OPT_U64)
 OPTION(ms_inject_socket_failures, OPT_U64)
+OPTION(mds_inject_skip_replaying_inotable, OPT_BOOL)
+OPTION(mds_kill_skip_replaying_inotable, OPT_BOOL)
 SAFE_OPTION(ms_inject_delay_type, OPT_STR)          // "osd mds mon client" allowed
 OPTION(ms_inject_delay_max, OPT_DOUBLE)         // seconds
 OPTION(ms_inject_delay_probability, OPT_DOUBLE) // range [0, 1]
@@ -806,6 +808,10 @@ OPTION(rocksdb_collect_compaction_stats, OPT_BOOL) //For rocksdb, this behavior 
 OPTION(rocksdb_collect_extended_stats, OPT_BOOL) //For rocksdb, this behavior will be an overhead of 5%~10%, collected only rocksdb_perf is enabled.
 OPTION(rocksdb_collect_memory_stats, OPT_BOOL) //For rocksdb, this behavior will be an overhead of 5%~10%, collected only rocksdb_perf is enabled.
 
+OPTION(rocksdb_cf_compact_on_deletion, OPT_BOOL)
+OPTION(rocksdb_cf_compact_on_deletion_sliding_window, OPT_INT)
+OPTION(rocksdb_cf_compact_on_deletion_trigger, OPT_INT)
+
 // rocksdb options that will be used for omap(if omap_backend is rocksdb)
 OPTION(filestore_rocksdb_options, OPT_STR)
 // rocksdb options that will be used in monstore
@@ -902,6 +908,7 @@ OPTION(objectstore_blackhole, OPT_BOOL)
 
 OPTION(bluefs_alloc_size, OPT_U64)
 OPTION(bluefs_shared_alloc_size, OPT_U64)
+OPTION(bluefs_failed_shared_alloc_cooldown, OPT_DOUBLE)
 OPTION(bluefs_max_prefetch, OPT_U64)
 OPTION(bluefs_min_log_runway, OPT_U64)  // alloc when we get this low
 OPTION(bluefs_max_log_runway, OPT_U64)  // alloc this much at a time
@@ -1265,6 +1272,11 @@ OPTION(rgw_override_bucket_index_max_shards, OPT_U32)
 OPTION(rgw_bucket_index_max_aio, OPT_U32)
 
 /**
+ * Represents the maximum AIO pending requests for multi object delete requests.
+ */
+OPTION(rgw_multi_obj_del_max_aio, OPT_U32)
+
+/**
  * whether or not the quota/gc threads should be started
  */
 OPTION(rgw_enable_quota_threads, OPT_BOOL)
@@ -1571,3 +1583,6 @@ OPTION(debug_allow_any_pool_priority, OPT_BOOL)
 OPTION(rgw_gc_max_deferred_entries_size, OPT_U64) // GC deferred entries size in queue head
 OPTION(rgw_gc_max_queue_size, OPT_U64) // GC max queue size
 OPTION(rgw_gc_max_deferred, OPT_U64) // GC max number of deferred entries
+
+OPTION(rgw_debug_inject_set_olh_err, OPT_U64) // dev option to inject an error in set_olh
+OPTION(rgw_debug_inject_olh_cancel_modification_err, OPT_BOOL) // dev option to simulate olh cancel modification error
