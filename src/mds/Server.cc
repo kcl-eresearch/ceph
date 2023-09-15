@@ -4491,7 +4491,7 @@ void Server::handle_client_open(MDRequestRef& mdr)
   }
 
   // increase max_size?
-  if (cmode & CEPH_FILE_MODE_WR)
+  if (cur->is_auth() && cur->is_file() && cmode & CEPH_FILE_MODE_WR)
     mds->locker->check_inode_max_size(cur);
 
   // make sure this inode gets into the journal
