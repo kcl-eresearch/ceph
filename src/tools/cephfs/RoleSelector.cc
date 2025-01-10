@@ -21,7 +21,7 @@ int MDSRoleSelector::parse_rank(
     if (!rank_err.empty()) {
       return -EINVAL;
     }
-    if (fsmap.get_filesystem(fscid)->mds_map.is_dne(rank)) {
+    if (fsmap.get_filesystem(fscid)->mds_map.is_dne(rank) && !(fsmap.get_filesystem(fscid)->mds_map.is_stopped(rank) || fsmap.get_filesystem(fscid)->mds_map.is_failed(rank))) {
       return -ENOENT;
     }
     roles.push_back(mds_role_t(fscid, rank));
